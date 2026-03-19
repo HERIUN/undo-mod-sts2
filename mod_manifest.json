@@ -1,0 +1,10 @@
+{
+  "id": "UndoMod",
+  "name": "Undo",
+  "author": "sts-agent",
+  "version": "1.0.0",
+  "description": "Undo last action in combat with a button or Ctrl+Z",
+  "has_dll": true,
+  "has_pck": false,
+  "affects_gameplay": true
+}
