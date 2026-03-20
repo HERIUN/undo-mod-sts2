@@ -51,11 +51,24 @@ public class StateSnapshot
     public List<OrbSnapshot> Orbs = new();
     public int OrbCapacity;
 
+    // 전투 기록 (History) 엔트리 수
+    public int HistoryEntryCount;
+
+    public class CostModifierSnapshot
+    {
+        public int Amount;
+        public int Type;        // LocalCostType enum as int
+        public int Expiration;  // LocalCostModifierExpiration enum as int
+        public bool ReduceOnly;
+    }
+
     public class CardSnapshot
     {
         public string Id = "";
         public bool IsUpgraded;
         public int EnergyCost;
+        public int EnergyCostBase;  // _base 필드
+        public List<CostModifierSnapshot>? CostModifiers;
         public CardModel? CardRef;
         public Godot.Node? HolderRef; // NHandCardHolder reference (핸드 카드용)
         public string? AfflictionId;         // 구속 Entry (예: "Bound", "Hexed" 등)
@@ -84,6 +97,7 @@ public class StateSnapshot
     {
         public string Id = "";
         public int Amount;
+        public PowerModel? PowerRef;  // 원본 파워 참조 (죽은 적 복원용)
     }
 
     public class PetSnapshot
@@ -92,6 +106,7 @@ public class StateSnapshot
         public int MaxHp;
         public int Block;
         public Creature? CreatureRef;
+        public List<PowerSnapshot> Powers = new();
     }
 
     public class RelicSnapshot
@@ -99,6 +114,8 @@ public class StateSnapshot
         public string Id = "";
         public int Counter;
         public RelicModel? RelicRef;
+        public string? CounterFieldName;
+        public Type? CounterFieldDeclaringType;
     }
 
     public class PotionSnapshot
@@ -189,7 +206,7 @@ public class StateSnapshot
             // 플레이어 버프
             foreach (var p in creature.Powers)
             {
-                snap.PlayerPowers.Add(new PowerSnapshot { Id = p.Id.Entry, Amount = p.Amount });
+                snap.PlayerPowers.Add(new PowerSnapshot { Id = p.Id.Entry, Amount = p.Amount, PowerRef = p });
             }
 
             // 적
@@ -207,7 +224,7 @@ public class StateSnapshot
                 };
                 foreach (var p in enemy.Powers)
                 {
-                    es.Powers.Add(new PowerSnapshot { Id = p.Id.Entry, Amount = p.Amount });
+                    es.Powers.Add(new PowerSnapshot { Id = p.Id.Entry, Amount = p.Amount, PowerRef = p });
                 }
                 snap.Enemies.Add(es);
             }
@@ -217,13 +234,20 @@ public class StateSnapshot
             {
                 foreach (var pet in pcs.Pets)
                 {
-                    snap.Pets.Add(new PetSnapshot
+                    var petSnap = new PetSnapshot
                     {
                         Hp = pet.CurrentHp,
                         MaxHp = pet.MaxHp,
                         Block = pet.Block,
                         CreatureRef = pet,
-                    });
+                    };
+                    try
+                    {
+                        foreach (var p in pet.Powers)
+                            petSnap.Powers.Add(new PowerSnapshot { Id = p.Id.Entry, Amount = p.Amount, PowerRef = p });
+                    }
+                    catch { }
+                    snap.Pets.Add(petSnap);
                 }
             }
 
@@ -242,12 +266,15 @@ public class StateSnapshot
             // 유물 카운터
             foreach (var relic in player.Relics)
             {
-                snap.Relics.Add(new RelicSnapshot
+                var rs = new RelicSnapshot
                 {
                     Id = relic.Id.Entry,
                     Counter = relic.DisplayAmount,
                     RelicRef = relic,
-                });
+                };
+                // 캡처 시점에 backing 필드를 찾아서 저장 (값이 0이 아닐 때 더 정확)
+                FindRelicCounterField(relic, rs);
+                snap.Relics.Add(rs);
             }
 
             // 구체
@@ -265,7 +292,16 @@ public class StateSnapshot
                 }
             }
 
-            ModEntry.Log($"스냅샷 저장: HP {snap.PlayerHp}, 에너지 {snap.Energy}, 핸드 {snap.Hand.Count}장");
+            // 전투 기록 엔트리 수 저장
+            try
+            {
+                var history = CombatManager.Instance?.History;
+                if (history != null)
+                    snap.HistoryEntryCount = history.Entries.Count();
+            }
+            catch { }
+
+            ModEntry.Log($"스냅샷 저장: HP {snap.PlayerHp}, 에너지 {snap.Energy}, 핸드 {snap.Hand.Count}장, History {snap.HistoryEntryCount}");
             return snap;
         }
         catch (Exception ex)
@@ -389,7 +425,7 @@ public class StateSnapshot
             SetProperty(creature, "CurrentHp", PlayerHp);
             SetProperty(creature, "Block", PlayerBlock);
             SetProperty(pcs, "Energy", Energy);
-            SetField(pcs, "Stars", Stars);
+            SetProperty(pcs, "Stars", Stars);
             SetProperty(state, "RoundNumber", RoundNumber);
 
             // PlayerActionsDisabled 리셋 (포션 사용 중 설정될 수 있음)
@@ -622,7 +658,7 @@ public class StateSnapshot
                 if (rs.RelicRef != null && rs.RelicRef.DisplayAmount != rs.Counter)
                 {
                     ModEntry.Log($"  유물: {rs.Id}, 저장={rs.Counter}, 현재={rs.RelicRef.DisplayAmount}");
-                    RestoreRelicCounter(rs.RelicRef, rs.Counter);
+                    RestoreRelicCounter(rs);
                     ModEntry.Log($"    설정 후: {rs.RelicRef.DisplayAmount}");
                 }
             }
@@ -654,6 +690,12 @@ public class StateSnapshot
             RestoreCardEnchantments(DiscardPile);
             RestoreCardEnchantments(ExhaustPile);
 
+            // 카드 비용 수정자 복원
+            RestoreCardCostModifiers(Hand);
+            RestoreCardCostModifiers(DrawPile);
+            RestoreCardCostModifiers(DiscardPile);
+            RestoreCardCostModifiers(ExhaustPile);
+
             // 플레이어 파워 복원
             RestorePowers(creature, PlayerPowers);
 
@@ -666,9 +708,35 @@ public class StateSnapshot
             {
                 if (es.CreatureRef != null)
                 {
+                    bool wasDead = es.CreatureRef.IsDead;
+                    bool shouldBeAlive = es.Hp > 0;
+
+                    // 죽은 적 → CombatState 먼저 복원 (파워 복원에 필요)
+                    if (wasDead && shouldBeAlive)
+                    {
+                        var cs = CombatManager.Instance?.DebugOnlyGetState();
+                        if (cs != null && es.CreatureRef.CombatState == null)
+                        {
+                            SetProperty(es.CreatureRef, "CombatState", cs);
+                        }
+                    }
+
                     SetProperty(es.CreatureRef, "CurrentHp", es.Hp);
                     SetProperty(es.CreatureRef, "Block", es.Block);
                     RestorePowers(es.CreatureRef, es.Powers);
+
+                    // 죽은 적을 살려야 하는 경우 → CombatState 등록 + NCreature 노드 재생성
+                    if (wasDead && shouldBeAlive)
+                    {
+                        try
+                        {
+                            ReviveEnemy(es.CreatureRef);
+                        }
+                        catch (Exception ex)
+                        {
+                            ModEntry.Log($"  적 부활 실패 ({es.CreatureRef.Name}): {ex.InnerException?.Message ?? ex.Message}");
+                        }
+                    }
                 }
             }
 
@@ -677,9 +745,43 @@ public class StateSnapshot
             {
                 if (ps.CreatureRef != null)
                 {
+                    SetField(ps.CreatureRef, "_maxHp", ps.MaxHp);
                     SetProperty(ps.CreatureRef, "CurrentHp", ps.Hp);
                     SetProperty(ps.CreatureRef, "Block", ps.Block);
                 }
+            }
+
+            // 전투 기록(History) 복원 — 스냅샷 이후에 추가된 항목 제거
+            try
+            {
+                var history = CombatManager.Instance?.History;
+                if (history != null)
+                {
+                    var entriesField = history.GetType().GetField("_entries", AllInstance);
+                    if (entriesField?.GetValue(history) is System.Collections.IList entries)
+                    {
+                        int currentCount = entries.Count;
+                        if (currentCount > HistoryEntryCount)
+                        {
+                            // RemoveRange로 스냅샷 이후 항목 제거
+                            var removeRange = entries.GetType().GetMethod("RemoveRange");
+                            if (removeRange != null)
+                            {
+                                removeRange.Invoke(entries, new object[] { HistoryEntryCount, currentCount - HistoryEntryCount });
+                                ModEntry.Log($"  History 복원: {currentCount} → {HistoryEntryCount} ({currentCount - HistoryEntryCount}개 제거)");
+
+                                // Changed 이벤트 발화 → CombatStateTracker가 UI 갱신
+                                var changedEvt = history.GetType().GetField("Changed", AllInstance);
+                                var handler = changedEvt?.GetValue(history) as Action;
+                                handler?.Invoke();
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                ModEntry.Log($"  History 복원 실패: {ex.Message}");
             }
 
             // 카드 더미 UI 버튼 직접 갱신
@@ -706,6 +808,31 @@ public class StateSnapshot
                 EnergyCost = c.EnergyCost.GetWithModifiers(CostModifiers.All),
                 CardRef = c,
             };
+            // 비용 수정자 캡처
+            try
+            {
+                var ecObj = c.EnergyCost;
+                var baseField = ecObj.GetType().GetField("_base", AllInstance);
+                if (baseField != null)
+                    cs.EnergyCostBase = (int)baseField.GetValue(ecObj)!;
+                var modField = ecObj.GetType().GetField("_localModifiers", AllInstance);
+                if (modField?.GetValue(ecObj) is System.Collections.IList mods && mods.Count > 0)
+                {
+                    cs.CostModifiers = new List<CostModifierSnapshot>();
+                    foreach (var mod in mods)
+                    {
+                        var modType = mod.GetType();
+                        cs.CostModifiers.Add(new CostModifierSnapshot
+                        {
+                            Amount = (int)(modType.GetProperty("Amount")?.GetValue(mod) ?? 0),
+                            Type = (int)(modType.GetProperty("Type")?.GetValue(mod) ?? 0),
+                            Expiration = (int)(modType.GetProperty("Expiration")?.GetValue(mod) ?? 0),
+                            ReduceOnly = (bool)(modType.GetProperty("IsReduceOnly")?.GetValue(mod) ?? false),
+                        });
+                    }
+                }
+            }
+            catch { }
             if (c.Affliction != null)
             {
                 cs.AfflictionId = c.Affliction.Id.Entry;
@@ -965,7 +1092,281 @@ public class StateSnapshot
         }
     }
 
-    private static bool _relicFieldsLogged;
+    /// <summary>카드 비용 수정자(_localModifiers)를 스냅샷 시점으로 복원</summary>
+    private void RestoreCardCostModifiers(List<CardSnapshot> snapshots)
+    {
+        foreach (var cs in snapshots)
+        {
+            if (cs.CardRef == null) continue;
+            try
+            {
+                var ecObj = cs.CardRef.EnergyCost;
+                var baseField = ecObj.GetType().GetField("_base", AllInstance);
+                var modField = ecObj.GetType().GetField("_localModifiers", AllInstance);
+                if (baseField == null || modField == null) continue;
+
+                bool changed = false;
+
+                // _base 복원
+                int currentBase = (int)baseField.GetValue(ecObj)!;
+                if (currentBase != cs.EnergyCostBase)
+                {
+                    baseField.SetValue(ecObj, cs.EnergyCostBase);
+                    ModEntry.Log($"    카드 비용 base 복원: {cs.Id} {currentBase} → {cs.EnergyCostBase}");
+                    changed = true;
+                }
+
+                // _localModifiers 복원
+                var currentMods = modField.GetValue(ecObj) as System.Collections.IList;
+                if (cs.CostModifiers == null || cs.CostModifiers.Count == 0)
+                {
+                    // 스냅샷에 modifier 없었으면 현재 것도 클리어
+                    if (currentMods != null && currentMods.Count > 0)
+                    {
+                        currentMods.Clear();
+                        ModEntry.Log($"    카드 비용 modifier 클리어: {cs.Id}");
+                        changed = true;
+                    }
+                }
+                else
+                {
+                    // modifier 재구성
+                    var localCostModType = typeof(CardEnergyCost).Assembly.GetType(
+                        "MegaCrit.Sts2.Core.Entities.Cards.LocalCostModifier");
+                    var localCostTypeEnum = typeof(CardEnergyCost).Assembly.GetType(
+                        "MegaCrit.Sts2.Core.Entities.Cards.LocalCostType");
+                    var localCostExpEnum = typeof(CardEnergyCost).Assembly.GetType(
+                        "MegaCrit.Sts2.Core.Entities.Cards.LocalCostModifierExpiration");
+
+                    if (localCostModType != null && localCostTypeEnum != null && localCostExpEnum != null && currentMods != null)
+                    {
+                        currentMods.Clear();
+                        foreach (var cms in cs.CostModifiers)
+                        {
+                            var ctor = localCostModType.GetConstructors()[0];
+                            var mod = ctor.Invoke(new object[]
+                            {
+                                cms.Amount,
+                                Enum.ToObject(localCostTypeEnum, cms.Type),
+                                Enum.ToObject(localCostExpEnum, cms.Expiration),
+                                cms.ReduceOnly,
+                            });
+                            currentMods.Add(mod);
+                        }
+                        ModEntry.Log($"    카드 비용 modifier 복원: {cs.Id} ({cs.CostModifiers.Count}개)");
+                        changed = true;
+                    }
+                }
+
+                // 변경이 있으면 UI 갱신 이벤트 발화
+                if (changed)
+                    cs.CardRef.InvokeEnergyCostChanged();
+            }
+            catch (Exception ex)
+            {
+                ModEntry.Log($"    카드 비용 복원 실패 ({cs.Id}): {ex.InnerException?.Message ?? ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>죽은 적을 부활시킴: NCreature 노드 재생성 + NCombatRoom에 추가</summary>
+    private static void ReviveEnemy(Creature enemy)
+    {
+        // NCombatRoom.Instance에 접근
+        var tree = Godot.Engine.GetMainLoop() as Godot.SceneTree;
+        if (tree?.Root == null) return;
+
+        var combatRoomNode = FindNodeByType(tree.Root, "NCombatRoom");
+        if (combatRoomNode == null)
+        {
+            ModEntry.Log("  NCombatRoom 노드를 찾을 수 없음");
+            return;
+        }
+
+        var removingField = combatRoomNode.GetType().GetField("_removingCreatureNodes", AllInstance);
+        var creatureNodesField = combatRoomNode.GetType().GetField("_creatureNodes", AllInstance);
+
+        // 1) _removingCreatureNodes에서 이 적의 죽는 노드 정리
+        if (removingField?.GetValue(combatRoomNode) is System.Collections.IList removingNodes)
+        {
+            for (int i = removingNodes.Count - 1; i >= 0; i--)
+            {
+                var node = removingNodes[i] as Godot.Node;
+                if (node == null || !Godot.GodotObject.IsInstanceValid(node)) continue;
+
+                var entityProp = node.GetType().GetProperty("Entity", AllInstance);
+                var entity = entityProp?.GetValue(node) as Creature;
+                if (entity == enemy)
+                {
+                    // 죽음 애니메이션 취소
+                    try
+                    {
+                        var cancelTokenProp = node.GetType().GetProperty("DeathAnimCancelToken", AllInstance);
+                        var cancelToken = cancelTokenProp?.GetValue(node) as System.Threading.CancellationTokenSource;
+                        cancelToken?.Cancel();
+                    }
+                    catch { }
+
+                    removingNodes.RemoveAt(i);
+
+                    // 씬 트리에서 제거 (새 노드를 만들 것이므로)
+                    try
+                    {
+                        if (node.GetParent() != null)
+                            node.GetParent().RemoveChild(node);
+                        node.QueueFree();
+                    }
+                    catch { }
+
+                    ModEntry.Log($"  기존 죽는 노드 정리: {enemy.Name}");
+                    break;
+                }
+            }
+        }
+
+        // 2) _creatureNodes에서도 중복 정리
+        if (creatureNodesField?.GetValue(combatRoomNode) is System.Collections.IList existingNodes)
+        {
+            for (int i = existingNodes.Count - 1; i >= 0; i--)
+            {
+                var node = existingNodes[i] as Godot.Node;
+                if (node == null || !Godot.GodotObject.IsInstanceValid(node)) continue;
+
+                var entityProp = node.GetType().GetProperty("Entity", AllInstance);
+                var entity = entityProp?.GetValue(node) as Creature;
+                if (entity == enemy)
+                {
+                    existingNodes.RemoveAt(i);
+                    try
+                    {
+                        if (node.GetParent() != null)
+                            node.GetParent().RemoveChild(node);
+                        node.QueueFree();
+                    }
+                    catch { }
+                    ModEntry.Log($"  기존 노드 정리: {enemy.Name}");
+                }
+            }
+        }
+
+        // 3) CombatState에 적 다시 등록 (죽을 때 RemoveCreature로 제거됨)
+        var combatState = CombatManager.Instance?.DebugOnlyGetState();
+        if (combatState != null)
+        {
+            // CombatState가 null이면 복원 (RemoveCreature에서 null로 설정됨)
+            if (enemy.CombatState == null)
+            {
+                SetProperty(enemy, "CombatState", combatState);
+                ModEntry.Log($"  CombatState 복원: {enemy.Name}");
+            }
+
+            // _enemies 리스트에 다시 추가
+            if (!combatState.ContainsCreature(enemy))
+            {
+                try
+                {
+                    combatState.AddCreature(enemy);
+                    ModEntry.Log($"  CombatState.Enemies에 재등록: {enemy.Name}");
+                }
+                catch (Exception ex)
+                {
+                    ModEntry.Log($"  CombatState.AddCreature 실패: {ex.Message}");
+                    // 실패 시 직접 _enemies 리스트에 추가
+                    try
+                    {
+                        var enemiesField = combatState.GetType().GetField("_enemies", AllInstance);
+                        if (enemiesField?.GetValue(combatState) is System.Collections.IList enemiesList)
+                        {
+                            enemiesList.Add(enemy);
+                            ModEntry.Log($"  _enemies 리스트에 직접 추가: {enemy.Name}");
+                        }
+                    }
+                    catch { }
+                }
+            }
+        }
+
+        // 4) NCombatRoom.AddCreature()로 새 UI 노드 생성
+        //    → NCreature.Create() → _Ready() → _stateDisplay.SetCreature(Entity)
+        //    → NPowerContainer.SetCreature() → 현재 creature.Powers를 읽어 NPower 노드 생성
+        //    → NHealthBar.SetCreature() → HP 표시
+        var addCreature = combatRoomNode.GetType().GetMethod("AddCreature", AllInstance);
+        if (addCreature != null)
+        {
+            addCreature.Invoke(combatRoomNode, new object[] { enemy });
+            ModEntry.Log($"  적 부활 (새 노드 생성): {enemy.Name}");
+
+            // 4) 인텐트 UI 갱신
+            try
+            {
+                var getCreatureNode = combatRoomNode.GetType().GetMethod("GetCreatureNode", AllInstance);
+                var newNode = getCreatureNode?.Invoke(combatRoomNode, new object[] { enemy }) as Godot.Node;
+                if (newNode != null)
+                {
+                    var refreshIntents = newNode.GetType().GetMethod("RefreshIntents", AllInstance);
+                    refreshIntents?.Invoke(newNode, null);
+                    ModEntry.Log($"  인텐트 UI 갱신 완료");
+                }
+            }
+            catch (Exception ex) { ModEntry.Log($"  인텐트 UI 갱신 실패: {ex.Message}"); }
+        }
+        else
+        {
+            ModEntry.Log($"  AddCreature 메서드를 찾을 수 없음");
+        }
+    }
+
+    private static Godot.Node? _pendingHandRefresh;
+
+    private static void OnDeferredHandRefresh()
+    {
+        // 1회만 실행, 시그널 해제
+        var tree = Godot.Engine.GetMainLoop() as Godot.SceneTree;
+        if (tree != null)
+            tree.ProcessFrame -= OnDeferredHandRefresh;
+
+        var handNode = _pendingHandRefresh;
+        _pendingHandRefresh = null;
+        if (handNode == null) return;
+
+        try
+        {
+            var containerProp = handNode.GetType().GetProperty("CardHolderContainer", AllInstance);
+            var container = containerProp?.GetValue(handNode) as Godot.Control;
+            if (container == null)
+            {
+                ModEntry.Log("  지연 갱신: CardHolderContainer 없음");
+                return;
+            }
+
+            int updated = 0;
+            for (int i = 0; i < container.GetChildCount(); i++)
+            {
+                var child = container.GetChild(i);
+                // UpdateCard 호출 시도
+                var updateCard = child.GetType().GetMethod("UpdateCard",
+                    BindingFlags.Instance | BindingFlags.Public);
+                if (updateCard != null)
+                {
+                    try
+                    {
+                        updateCard.Invoke(child, null);
+                        updated++;
+                    }
+                    catch (Exception ex)
+                    {
+                        ModEntry.Log($"  UpdateCard 실패: {ex.InnerException?.Message ?? ex.Message}");
+                    }
+                }
+            }
+            ModEntry.Log($"  지연 핸드 비주얼 갱신: {updated}장");
+        }
+        catch (Exception ex)
+        {
+            ModEntry.Log($"  지연 핸드 비주얼 갱신 실패: {ex.InnerException?.Message ?? ex.Message}");
+        }
+    }
+
     private static bool _combatStateLogged;
     private static bool _playerLogged;
     private static bool _pileButtonLogged;
@@ -983,7 +1384,7 @@ public class StateSnapshot
             SetPileButtonCount(tree.Root, "NDiscardPileButton", pcs.DiscardPile.Cards.Count, preDiscardCount, "Discard");
             SetPileButtonCount(tree.Root, "NExhaustPileButton", pcs.ExhaustPile.Cards.Count, preExhaustCount, "Exhaust");
 
-            // 2. 카드 플레이 상태 초기화 (카드 멈춤 방지)
+            // 2. 카드 플레이 상태 초기화 (카드 멈춤 방지) + 핸드 카드 비주얼 갱신
             var handNode = FindNodeByType(tree.Root, "NPlayerHand");
             if (handNode != null)
             {
@@ -992,6 +1393,15 @@ public class StateSnapshot
                 {
                     cancelMethod.Invoke(handNode, null);
                     ModEntry.Log("  CancelAllCardPlay 호출");
+                }
+
+                // 핸드 카드 비주얼 갱신을 다음 프레임으로 지연 (현재 프레임에선 노드가 준비 안 됨)
+                _pendingHandRefresh = handNode;
+                var refreshTree = Godot.Engine.GetMainLoop() as Godot.SceneTree;
+                if (refreshTree != null)
+                {
+                    refreshTree.ProcessFrame += OnDeferredHandRefresh;
+                    ModEntry.Log("  핸드 카드 비주얼 갱신 예약됨 (다음 프레임)");
                 }
             }
         }
@@ -1121,6 +1531,55 @@ public class StateSnapshot
                 catch (Exception ex)
                 {
                     ModEntry.Log($"    파워 제거 실패 ({power.Id.Entry}): {ex.InnerException?.Message ?? ex.Message}");
+                }
+            }
+
+            // 스냅샷에 있지만 현재 없는 파워 → 저장된 PowerRef를 직접 _powers에 추가
+            // savedPowerMap에 남아있는 항목이 추가해야 할 파워
+            if (savedPowerMap.Count > 0)
+            {
+                // savedPowers에서 PowerRef를 찾아 사용
+                var powersField = creature.GetType().GetField("_powers", AllInstance);
+                var powersList = powersField?.GetValue(creature) as System.Collections.IList;
+
+                foreach (var kvp in savedPowerMap)
+                {
+                    string powerId = kvp.Key;
+                    int amount = kvp.Value;
+                    try
+                    {
+                        // 저장된 PowerRef 찾기
+                        var savedPower = savedPowers.FirstOrDefault(sp => sp.Id == powerId);
+                        if (savedPower?.PowerRef != null)
+                        {
+                            // Owner를 이 creature로 설정
+                            SetProperty(savedPower.PowerRef, "Owner", creature);
+                            SetProperty(savedPower.PowerRef, "Amount", amount);
+
+                            // _powers 리스트에 직접 추가
+                            if (powersList != null && !powersList.Contains(savedPower.PowerRef))
+                            {
+                                powersList.Add(savedPower.PowerRef);
+                                // PowerApplied 이벤트 발생 (NPowerContainer가 듣고 있으면 UI 갱신)
+                                try
+                                {
+                                    creature.GetType().GetField("PowerApplied", AllInstance)?
+                                        .GetValue(creature);
+                                    // 이벤트 직접 호출은 복잡하므로 생략 — AddCreature가 새 노드를 만들어 처리
+                                }
+                                catch { }
+                                ModEntry.Log($"    파워 직접 추가: {powerId} = {amount}");
+                            }
+                        }
+                        else
+                        {
+                            ModEntry.Log($"    파워 추가 실패: {powerId} - PowerRef 없음");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        ModEntry.Log($"    파워 추가 실패 ({powerId}): {ex.InnerException?.Message ?? ex.Message}");
+                    }
                 }
             }
         }
@@ -1869,78 +2328,123 @@ public class StateSnapshot
         }
     }
 
-    /// <summary>유물의 내부 카운터 필드를 찾아 복원</summary>
-    private static void RestoreRelicCounter(RelicModel relic, int targetValue)
+    // 유물 타입별 backing 필드 캐시
+    private static readonly Dictionary<string, (Type declaringType, string fieldName)?> _relicFieldCache = new();
+
+    /// <summary>유물의 카운터 backing 필드를 찾아 RelicSnapshot에 저장 (캡처 시점)</summary>
+    private static void FindRelicCounterField(RelicModel relic, RelicSnapshot rs)
     {
-        // DisplayAmount는 각 유물 서브클래스에서 오버라이드한 computed property.
-        // 내부 int 필드를 찾아서 직접 설정해야 함.
-        var relicType = relic.GetType();
-        int currentDisplay = relic.DisplayAmount;
+        var relicTypeName = relic.GetType().FullName ?? relic.GetType().Name;
 
-        // 1회만 유물 필드 덤프
-        if (!_relicFieldsLogged)
+        // 캐시에 있으면 재사용
+        if (_relicFieldCache.TryGetValue(relicTypeName, out var cached))
         {
-            _relicFieldsLogged = true;
-            var t = relicType;
-            while (t != null && t != typeof(object))
+            if (cached != null)
             {
-                ModEntry.Log($"  === {t.Name} 필드 ===");
-                foreach (var f in t.GetFields(AllInstance | BindingFlags.DeclaredOnly))
-                    ModEntry.Log($"    F: {f.Name} : {f.FieldType.Name} = {f.GetValue(relic)}");
-                t = t.BaseType;
+                rs.CounterFieldName = cached.Value.fieldName;
+                rs.CounterFieldDeclaringType = cached.Value.declaringType;
             }
+            return;
         }
 
-        // 서브클래스(유물 구현)의 int 필드 중 현재 DisplayAmount와 값이 같은 것을 찾아 설정
-        var concreteFields = relicType.GetFields(AllInstance | BindingFlags.DeclaredOnly)
-            .Where(f => f.FieldType == typeof(int))
-            .ToList();
-
-        if (concreteFields.Count > 0)
+        int displayAmount = relic.DisplayAmount;
+        if (displayAmount == 0)
         {
-            foreach (var f in concreteFields)
-            {
-                int val = (int)f.GetValue(relic)!;
-                if (val == currentDisplay)
-                {
-                    f.SetValue(relic, targetValue);
-                    ModEntry.Log($"    유물 필드 설정: {relicType.Name}.{f.Name} = {targetValue}");
-
-                    // DisplayAmountChanged 이벤트 발화 (UI 갱신)
-                    var evt = typeof(RelicModel).GetField("DisplayAmountChanged", AllInstance);
-                    var handler = evt?.GetValue(relic) as Action;
-                    handler?.Invoke();
-                    return;
-                }
-            }
+            // DisplayAmount가 0이면 필드 식별이 어려움 — 캐시하지 않고 다음 기회에 시도
+            return;
         }
 
-        // 서브클래스 필드에서 못 찾으면, 부모 RelicModel의 _dynamicVars를 통해 시도
-        // 또는 모든 int 필드를 상위 타입에서도 검색
-        var t2 = relicType.BaseType;
-        while (t2 != null && t2 != typeof(object))
+        // 서브클래스부터 상위로 int 필드 검색
+        var t = relic.GetType();
+        while (t != null && t != typeof(object))
         {
-            foreach (var f in t2.GetFields(AllInstance | BindingFlags.DeclaredOnly))
+            foreach (var f in t.GetFields(AllInstance | BindingFlags.DeclaredOnly))
             {
                 if (f.FieldType == typeof(int))
                 {
                     int val = (int)f.GetValue(relic)!;
-                    if (val == currentDisplay && f.Name.Contains("count", StringComparison.OrdinalIgnoreCase))
+                    if (val == displayAmount)
                     {
-                        f.SetValue(relic, targetValue);
-                        ModEntry.Log($"    유물 부모 필드 설정: {t2.Name}.{f.Name} = {targetValue}");
-
-                        var evt = typeof(RelicModel).GetField("DisplayAmountChanged", AllInstance);
-                        var handler = evt?.GetValue(relic) as Action;
-                        handler?.Invoke();
+                        rs.CounterFieldName = f.Name;
+                        rs.CounterFieldDeclaringType = t;
+                        _relicFieldCache[relicTypeName] = (t, f.Name);
+                        ModEntry.Log($"    유물 카운터 필드 발견: {t.Name}.{f.Name} (값={val})");
                         return;
                     }
                 }
             }
-            t2 = t2.BaseType;
+            t = t.BaseType;
+        }
+
+        // 못 찾음
+        _relicFieldCache[relicTypeName] = null;
+    }
+
+    /// <summary>유물의 내부 카운터 필드를 복원</summary>
+    private static void RestoreRelicCounter(RelicSnapshot rs)
+    {
+        var relic = rs.RelicRef!;
+        var targetValue = rs.Counter;
+
+        // 스냅샷에 저장된 필드명이 있으면 직접 사용
+        if (rs.CounterFieldName != null && rs.CounterFieldDeclaringType != null)
+        {
+            var field = rs.CounterFieldDeclaringType.GetField(rs.CounterFieldName, AllInstance);
+            if (field != null)
+            {
+                field.SetValue(relic, targetValue);
+                ModEntry.Log($"    유물 필드 설정: {rs.CounterFieldDeclaringType.Name}.{rs.CounterFieldName} = {targetValue}");
+                InvokeRelicDisplayChanged(relic);
+                return;
+            }
+        }
+
+        // 캐시에서 시도
+        var relicTypeName = relic.GetType().FullName ?? relic.GetType().Name;
+        if (_relicFieldCache.TryGetValue(relicTypeName, out var cached) && cached != null)
+        {
+            var field = cached.Value.declaringType.GetField(cached.Value.fieldName, AllInstance);
+            if (field != null)
+            {
+                field.SetValue(relic, targetValue);
+                ModEntry.Log($"    유물 필드 설정 (캐시): {cached.Value.declaringType.Name}.{cached.Value.fieldName} = {targetValue}");
+                InvokeRelicDisplayChanged(relic);
+                return;
+            }
+        }
+
+        // 폴백: 현재 값 매칭 (기존 방식)
+        var relicType = relic.GetType();
+        int currentDisplay = relic.DisplayAmount;
+        var t = relicType;
+        while (t != null && t != typeof(object))
+        {
+            foreach (var f in t.GetFields(AllInstance | BindingFlags.DeclaredOnly))
+            {
+                if (f.FieldType == typeof(int))
+                {
+                    int val = (int)f.GetValue(relic)!;
+                    if (val == currentDisplay)
+                    {
+                        f.SetValue(relic, targetValue);
+                        ModEntry.Log($"    유물 필드 설정 (폴백): {t.Name}.{f.Name} = {targetValue}");
+                        _relicFieldCache[relicTypeName] = (t, f.Name);
+                        InvokeRelicDisplayChanged(relic);
+                        return;
+                    }
+                }
+            }
+            t = t.BaseType;
         }
 
         ModEntry.Log($"    유물 카운터 필드를 찾지 못함: {relicType.Name}");
+    }
+
+    private static void InvokeRelicDisplayChanged(RelicModel relic)
+    {
+        var evt = typeof(RelicModel).GetField("DisplayAmountChanged", AllInstance);
+        var handler = evt?.GetValue(relic) as Action;
+        handler?.Invoke();
     }
 
     private static void SetProperty(object obj, string name, object value)
