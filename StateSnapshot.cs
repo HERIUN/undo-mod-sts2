@@ -76,7 +76,9 @@ public class StateSnapshot
         public int AfflictionAmount;         // 구속 수치
         public string? EnchantmentId;        // 인챈트 Entry
         public string? EnchantmentCategory;  // 인챈트 Category
-        public int EnchantmentAmount;        // 인챈트 수치
+        public int EnchantmentAmount;        // 인챈트 수치 (캡처 시점 값)
+        public int EnchantmentStatusVal;    // _status enum 값 (캡처 시점)
+        public object? EnchantmentRef;       // 원본 EnchantmentModel 참조
     }
 
     // 핸드 카드의 NHandCardHolder 레퍼런스 저장
@@ -116,6 +118,8 @@ public class StateSnapshot
         public RelicModel? RelicRef;
         public string? CounterFieldName;
         public Type? CounterFieldDeclaringType;
+        public int StatusVal;  // RelicStatus enum as int
+        public Dictionary<string, object?> ExtraFields = new(); // 유물별 추가 필드 (bool/int)
     }
 
     public class PotionSnapshot
@@ -130,6 +134,7 @@ public class StateSnapshot
         public string Type = "";
         public decimal PassiveVal;
         public decimal EvokeVal;
+        public object? OrbRef;  // OrbModel 참조
     }
 
     private static readonly BindingFlags AllInstance =
@@ -263,7 +268,7 @@ public class StateSnapshot
                 });
             }
 
-            // 유물 카운터
+            // 유물 카운터 + 내부 상태
             foreach (var relic in player.Relics)
             {
                 var rs = new RelicSnapshot
@@ -274,6 +279,20 @@ public class StateSnapshot
                 };
                 // 캡처 시점에 backing 필드를 찾아서 저장 (값이 0이 아닐 때 더 정확)
                 FindRelicCounterField(relic, rs);
+                // Status 저장
+                try
+                {
+                    var statusProp = relic.GetType().GetProperty("Status", AllInstance);
+                    if (statusProp != null)
+                    {
+                        var statusVal = statusProp.GetValue(relic);
+                        if (statusVal != null)
+                            rs.StatusVal = (int)Convert.ChangeType(statusVal, typeof(int));
+                    }
+                }
+                catch { }
+                // 유물별 bool/int 필드 캡처 (턴 중 변경되는 상태)
+                CaptureRelicExtraFields(relic, rs);
                 snap.Relics.Add(rs);
             }
 
@@ -288,6 +307,7 @@ public class StateSnapshot
                         Type = orb.Id.Entry,
                         PassiveVal = orb.PassiveVal,
                         EvokeVal = orb.EvokeVal,
+                        OrbRef = orb,
                     });
                 }
             }
@@ -652,15 +672,34 @@ public class StateSnapshot
                 ModEntry.Log($"  포션 복원 실패: {ex.Message}\n{ex.StackTrace}");
             }
 
-            // 유물 카운터 복원
+            // 유물 카운터 + 내부 상태 복원
             foreach (var rs in Relics)
             {
-                if (rs.RelicRef != null && rs.RelicRef.DisplayAmount != rs.Counter)
+                if (rs.RelicRef == null) continue;
+                if (rs.RelicRef.DisplayAmount != rs.Counter)
                 {
                     ModEntry.Log($"  유물: {rs.Id}, 저장={rs.Counter}, 현재={rs.RelicRef.DisplayAmount}");
                     RestoreRelicCounter(rs);
                     ModEntry.Log($"    설정 후: {rs.RelicRef.DisplayAmount}");
                 }
+                // Status 복원
+                try
+                {
+                    var statusProp = rs.RelicRef.GetType().GetProperty("Status", AllInstance);
+                    if (statusProp != null)
+                    {
+                        var currentStatus = (int)Convert.ChangeType(statusProp.GetValue(rs.RelicRef)!, typeof(int));
+                        if (currentStatus != rs.StatusVal)
+                        {
+                            var statusEnumVal = Enum.ToObject(statusProp.PropertyType, rs.StatusVal);
+                            statusProp.SetValue(rs.RelicRef, statusEnumVal);
+                            ModEntry.Log($"  유물 Status 복원: {rs.Id}, {currentStatus} → {rs.StatusVal}");
+                        }
+                    }
+                }
+                catch (Exception ex) { ModEntry.Log($"  유물 Status 복원 실패 ({rs.Id}): {ex.Message}"); }
+                // 추가 필드 복원
+                RestoreRelicExtraFields(rs);
             }
 
             // 핸드 이외의 더미 복원 (UI 차이 계산을 위해 현재 카운트 보존)
@@ -698,6 +737,9 @@ public class StateSnapshot
 
             // 플레이어 파워 복원
             RestorePowers(creature, PlayerPowers);
+
+            // 구체 복원 (디펙트)
+            RestoreOrbs(pcs);
 
             // ChainsOfBindingPower의 boundCardPlayed 플래그 리셋
             // (Bound 구속 카드 사용 후 undo 시 재사용 가능하도록)
@@ -843,7 +885,43 @@ public class StateSnapshot
             {
                 cs.EnchantmentId = c.Enchantment.Id.Entry;
                 cs.EnchantmentCategory = c.Enchantment.Id.Category;
-                cs.EnchantmentAmount = c.Enchantment.Amount;
+                cs.EnchantmentRef = c.Enchantment;  // 원본 참조 저장
+                // _amount와 _status를 리플렉션으로 직접 읽어 값으로 저장 (참조가 변경되어도 보존)
+                try
+                {
+                    var enchType = c.Enchantment.GetType();
+                    var amountField = enchType.GetField("_amount", AllInstance);
+                    if (amountField == null)
+                    {
+                        var bt = enchType;
+                        while (bt != null && bt != typeof(object))
+                        {
+                            amountField = bt.GetField("_amount", AllInstance | BindingFlags.DeclaredOnly);
+                            if (amountField != null) break;
+                            bt = bt.BaseType;
+                        }
+                    }
+                    cs.EnchantmentAmount = amountField != null ? (int)amountField.GetValue(c.Enchantment)! : c.Enchantment.Amount;
+
+                    var statusField = enchType.GetField("_status", AllInstance);
+                    if (statusField == null)
+                    {
+                        var bt = enchType;
+                        while (bt != null && bt != typeof(object))
+                        {
+                            statusField = bt.GetField("_status", AllInstance | BindingFlags.DeclaredOnly);
+                            if (statusField != null) break;
+                            bt = bt.BaseType;
+                        }
+                    }
+                    if (statusField != null)
+                        cs.EnchantmentStatusVal = (int)Convert.ChangeType(statusField.GetValue(c.Enchantment)!, typeof(int));
+                }
+                catch (Exception ex)
+                {
+                    cs.EnchantmentAmount = c.Enchantment.Amount;
+                    ModEntry.Log($"    인챈트 필드 읽기 실패 ({cs.Id}): {ex.Message}");
+                }
             }
             return cs;
         }).ToList();
@@ -1036,6 +1114,65 @@ public class StateSnapshot
         }
     }
 
+    /// <summary>
+    /// 카드에 새 mutable 인챈트를 생성하여 적용.
+    /// ClearEnchantmentInternal → EnchantInternal → ModifyCard → FinalizeUpgradeInternal
+    /// 게임의 정규 API 체인을 따라 효과와 비주얼 모두 복원.
+    /// </summary>
+    private static bool ApplyFreshEnchantment(CardModel card, string category, string entry, int amount)
+    {
+        try
+        {
+            // 1. 기존 인챈트 제거
+            if (card.Enchantment != null)
+            {
+                var clearMethod = card.GetType().GetMethod("ClearEnchantmentInternal", AllInstance);
+                clearMethod?.Invoke(card, null);
+                ModEntry.Log($"      기존 인챈트 제거 완료");
+            }
+
+            // 2. 새 mutable 인챈트 생성
+            var mutable = CreateMutableEnchantment(category, entry);
+            if (mutable == null)
+            {
+                ModEntry.Log($"      인챈트 생성 실패: {category}.{entry}");
+                return false;
+            }
+
+            // 3. EnchantInternal 호출 (AssertMutable → Enchantment 설정 → ApplyInternal → EnchantmentChanged 이벤트)
+            var enchantInternal = card.GetType().GetMethod("EnchantInternal", AllInstance);
+            if (enchantInternal != null)
+            {
+                enchantInternal.Invoke(card, new[] { mutable, (object)(decimal)amount });
+                ModEntry.Log($"      EnchantInternal 성공: {entry}({amount})");
+            }
+            else
+            {
+                ModEntry.Log($"      EnchantInternal 메서드 없음");
+                return false;
+            }
+
+            // 4. ModifyCard 호출 (OnEnchant → RecalculateValues → DynamicVars 재계산)
+            var modifyCard = mutable.GetType().GetMethod("ModifyCard", AllInstance);
+            if (modifyCard != null)
+            {
+                modifyCard.Invoke(mutable, null);
+                ModEntry.Log($"      ModifyCard 성공");
+            }
+
+            // 5. FinalizeUpgradeInternal 호출
+            var finalize = card.GetType().GetMethod("FinalizeUpgradeInternal", AllInstance);
+            finalize?.Invoke(card, null);
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            ModEntry.Log($"      인챈트 적용 실패: {ex.InnerException?.Message ?? ex.Message}");
+            return false;
+        }
+    }
+
     /// <summary>카드 인챈트(enchantment) 상태를 스냅샷 시점으로 복원</summary>
     private static void RestoreCardEnchantments(List<CardSnapshot> saved)
     {
@@ -1049,46 +1186,145 @@ public class StateSnapshot
                 bool hadEnchantment = cs.EnchantmentId != null;
                 bool hasEnchantment = currentEnchantment != null;
 
+                ModEntry.Log($"    인챈트 체크: {cs.Id} had={hadEnchantment}({cs.EnchantmentId},{cs.EnchantmentAmount}) has={hasEnchantment}({currentEnchantment?.Id.Entry})");
+
                 if (hadEnchantment && !hasEnchantment)
                 {
-                    // 스냅샷에 인챈트가 있었는데 지금 없으면 → 복원
-                    var mutable = CreateMutableEnchantment(cs.EnchantmentCategory!, cs.EnchantmentId!);
-                    if (mutable != null)
-                    {
-                        var enchantInternal = cs.CardRef.GetType().GetMethod("EnchantInternal", AllInstance);
-                        enchantInternal?.Invoke(cs.CardRef, new[] { mutable, (decimal)cs.EnchantmentAmount });
-                        ModEntry.Log($"    인챈트 복원: {cs.Id} ← {cs.EnchantmentId}({cs.EnchantmentAmount})");
-                    }
+                    // 스냅샷에 인챈트가 있었는데 지금 없으면 → 새로 생성하여 복원
+                    ApplyFreshEnchantment(cs.CardRef, cs.EnchantmentCategory!, cs.EnchantmentId!, cs.EnchantmentAmount);
                 }
                 else if (!hadEnchantment && hasEnchantment)
                 {
                     // 스냅샷에 인챈트가 없었는데 지금 있으면 → 제거
-                    var clearEnchantment = cs.CardRef.GetType().GetMethod("ClearEnchantmentInternal", AllInstance);
-                    clearEnchantment?.Invoke(cs.CardRef, null);
+                    var clearMethod = cs.CardRef.GetType().GetMethod("ClearEnchantmentInternal", AllInstance);
+                    clearMethod?.Invoke(cs.CardRef, null);
                     ModEntry.Log($"    인챈트 제거: {cs.Id} (was {currentEnchantment!.Id.Entry})");
                 }
                 else if (hadEnchantment && hasEnchantment)
                 {
-                    // 둘 다 있지만 종류/수치가 다르면 → 교체
-                    if (currentEnchantment!.Id.Entry != cs.EnchantmentId || currentEnchantment.Amount != cs.EnchantmentAmount)
-                    {
-                        var clearEnchantment = cs.CardRef.GetType().GetMethod("ClearEnchantmentInternal", AllInstance);
-                        clearEnchantment?.Invoke(cs.CardRef, null);
-
-                        var mutable = CreateMutableEnchantment(cs.EnchantmentCategory!, cs.EnchantmentId!);
-                        if (mutable != null)
-                        {
-                            var enchantInternal = cs.CardRef.GetType().GetMethod("EnchantInternal", AllInstance);
-                            enchantInternal?.Invoke(cs.CardRef, new[] { mutable, (decimal)cs.EnchantmentAmount });
-                            ModEntry.Log($"    인챈트 교체: {cs.Id} ← {cs.EnchantmentId}({cs.EnchantmentAmount})");
-                        }
-                    }
+                    // 둘 다 있어도 항상 새로 적용 (1회용 인챈트는 status가 Used로 변경되어 효과가 죽을 수 있음)
+                    ApplyFreshEnchantment(cs.CardRef, cs.EnchantmentCategory!, cs.EnchantmentId!, cs.EnchantmentAmount);
                 }
             }
             catch (Exception ex)
             {
                 ModEntry.Log($"    인챈트 복원 실패 ({cs.Id}): {ex.InnerException?.Message ?? ex.Message}");
             }
+        }
+    }
+
+    /// <summary>구체(OrbQueue) 복원</summary>
+    private void RestoreOrbs(MegaCrit.Sts2.Core.Entities.Players.PlayerCombatState pcs)
+    {
+        try
+        {
+            var orbQueue = pcs.OrbQueue;
+            if (orbQueue == null) return;
+
+            // 현재 상태와 비교
+            var currentOrbs = orbQueue.Orbs;
+            bool same = currentOrbs.Count == Orbs.Count && orbQueue.Capacity == OrbCapacity;
+            if (same)
+            {
+                for (int i = 0; i < Orbs.Count; i++)
+                {
+                    if (currentOrbs[i] != Orbs[i].OrbRef)
+                    {
+                        same = false;
+                        break;
+                    }
+                }
+            }
+            if (same) return;
+
+            // Capacity 복원
+            SetProperty(orbQueue, "Capacity", OrbCapacity);
+
+            // _orbs 리스트 직접 교체
+            var orbsField = orbQueue.GetType().GetField("_orbs", AllInstance);
+            if (orbsField?.GetValue(orbQueue) is System.Collections.IList orbsList)
+            {
+                orbsList.Clear();
+                foreach (var os in Orbs)
+                {
+                    if (os.OrbRef != null)
+                        orbsList.Add(os.OrbRef);
+                }
+            }
+
+            ModEntry.Log($"  구체 복원: {Orbs.Count}개, 용량 {OrbCapacity}");
+
+            // NOrbManager UI 갱신
+            try
+            {
+                var tree = Godot.Engine.GetMainLoop() as Godot.SceneTree;
+                if (tree?.Root == null) return;
+                var combatRoomNode = FindNodeByType(tree.Root, "NCombatRoom");
+                if (combatRoomNode == null) return;
+
+                // 플레이어 NCreature 노드에서 OrbManager 가져오기
+                var player = pcs.GetType().GetProperty("Player", AllInstance)?.GetValue(pcs)
+                    ?? pcs.GetType().GetField("_player", AllInstance)?.GetValue(pcs);
+                if (player == null) return;
+
+                var creatureProp = player.GetType().GetProperty("Creature", AllInstance);
+                var creature = creatureProp?.GetValue(player) as Creature;
+                if (creature == null) return;
+
+                var getCreatureNode = combatRoomNode.GetType().GetMethod("GetCreatureNode", AllInstance);
+                var nCreature = getCreatureNode?.Invoke(combatRoomNode, new object[] { creature }) as Godot.Node;
+                if (nCreature == null) return;
+
+                var orbManagerProp = nCreature.GetType().GetProperty("OrbManager", AllInstance);
+                var orbManager = orbManagerProp?.GetValue(nCreature) as Godot.Node;
+                if (orbManager == null) return;
+
+                // NOrbManager._orbs (NOrb 노드 리스트)를 재구성
+                var nOrbsField = orbManager.GetType().GetField("_orbs", AllInstance);
+                var nOrbContainer = orbManager.GetType().GetField("_orbContainer", AllInstance)?.GetValue(orbManager) as Godot.Control;
+                if (nOrbsField?.GetValue(orbManager) is System.Collections.IList nOrbsList && nOrbContainer != null)
+                {
+                    // 기존 NOrb 노드 모두 제거
+                    foreach (var nOrb in nOrbsList)
+                    {
+                        if (nOrb is Godot.Node n && Godot.GodotObject.IsInstanceValid(n))
+                            n.QueueFree();
+                    }
+                    nOrbsList.Clear();
+
+                    // 새 NOrb 슬롯 생성 (Capacity 만큼)
+                    var addSlotAnim = orbManager.GetType().GetMethod("AddSlotAnim", AllInstance);
+                    addSlotAnim?.Invoke(orbManager, new object[] { OrbCapacity });
+
+                    // 각 NOrb에 모델 설정
+                    nOrbsList = nOrbsField.GetValue(orbManager) as System.Collections.IList;
+                    if (nOrbsList != null)
+                    {
+                        for (int i = 0; i < Orbs.Count && i < nOrbsList.Count; i++)
+                        {
+                            if (Orbs[i].OrbRef != null && nOrbsList[i] is Godot.Node nOrbNode)
+                            {
+                                var replaceOrb = nOrbNode.GetType().GetMethod("ReplaceOrb", AllInstance);
+                                replaceOrb?.Invoke(nOrbNode, new object[] { Orbs[i].OrbRef });
+                            }
+                        }
+                    }
+
+                    // UpdateVisuals 호출
+                    var updateVisuals = orbManager.GetType().GetMethod("UpdateVisuals", AllInstance);
+                    updateVisuals?.Invoke(orbManager, new object[] { 0 }); // OrbEvokeType.None = 0
+                }
+
+                ModEntry.Log($"  구체 UI 갱신 완료");
+            }
+            catch (Exception ex)
+            {
+                ModEntry.Log($"  구체 UI 갱신 실패: {ex.InnerException?.Message ?? ex.Message}");
+            }
+        }
+        catch (Exception ex)
+        {
+            ModEntry.Log($"  구체 복원 실패: {ex.InnerException?.Message ?? ex.Message}");
         }
     }
 
@@ -1358,6 +1594,36 @@ public class StateSnapshot
                         ModEntry.Log($"  UpdateCard 실패: {ex.InnerException?.Message ?? ex.Message}");
                     }
                 }
+
+                // NHandCardHolder → CardNode(NCard) → 인챈트 비주얼 갱신
+                try
+                {
+                    var cardNodeProp = child.GetType().GetProperty("CardNode", AllInstance);
+                    var cardNode = cardNodeProp?.GetValue(child);
+                    if (cardNode != null)
+                    {
+                        var cmProp = child.GetType().GetProperty("CardModel", AllInstance);
+                        var cm = cmProp?.GetValue(child) as CardModel;
+                        if (cm?.Enchantment != null)
+                        {
+                            // 먼저 UpdateEnchantmentVisuals 시도 (이미 구독돼있을 수 있음)
+                            var updateEnchVis = cardNode.GetType().GetMethod("UpdateEnchantmentVisuals", AllInstance);
+                            updateEnchVis?.Invoke(cardNode, null);
+
+                            // EnchantmentTab 비주얼을 직접 Visible로 설정
+                            var enchTabProp = cardNode.GetType().GetProperty("EnchantmentTab", AllInstance);
+                            var enchTab = enchTabProp?.GetValue(cardNode) as Godot.Control;
+                            if (enchTab != null)
+                            {
+                                enchTab.Visible = true;
+                            }
+                        }
+                    }
+                }
+                catch (Exception enchEx)
+                {
+                    ModEntry.Log($"  인챈트 비주얼 갱신 실패: {enchEx.InnerException?.Message ?? enchEx.Message}");
+                }
             }
             ModEntry.Log($"  지연 핸드 비주얼 갱신: {updated}장");
         }
@@ -1395,6 +1661,147 @@ public class StateSnapshot
                     ModEntry.Log("  CancelAllCardPlay 호출");
                 }
 
+                // 핸드/턴 종료 버튼 상태 복원 (별도 try-catch로 감싸서 실패해도 핸드 갱신에 영향 없도록)
+                try
+                {
+                    // _currentCardPlay를 null로 직접 세팅 (InCardPlay 해제)
+                    var cardPlayField = handNode.GetType().GetField("_currentCardPlay", AllInstance);
+                    if (cardPlayField != null)
+                    {
+                        cardPlayField.SetValue(handNode, null);
+                        ModEntry.Log("  _currentCardPlay = null");
+                    }
+
+                    // CurrentMode를 Play로 리셋
+                    var modeField = handNode.GetType().GetField("_currentMode", AllInstance);
+                    if (modeField != null)
+                    {
+                        var modeEnumVal = Enum.ToObject(modeField.FieldType, 1); // Mode.Play = 1
+                        modeField.SetValue(handNode, modeEnumVal);
+                        ModEntry.Log("  _currentMode = Play");
+                    }
+
+                    // _holdersAwaitingQueue 클리어 (카드 플레이 대기열)
+                    var awaitField = handNode.GetType().GetField("_holdersAwaitingQueue", AllInstance);
+                    if (awaitField != null)
+                    {
+                        var awaitDict = awaitField.GetValue(handNode);
+                        if (awaitDict != null)
+                        {
+                            var clearAwait = awaitDict.GetType().GetMethod("Clear");
+                            clearAwait?.Invoke(awaitDict, null);
+                            ModEntry.Log("  _holdersAwaitingQueue 클리어");
+                        }
+                    }
+
+                    // NEndTurnButton 상태 복원 (턴 종료 가능하도록)
+                    var endTurnBtn = FindNodeByType(tree.Root, "NEndTurnButton");
+                    if (endTurnBtn != null)
+                    {
+                        // _state를 Enabled(0)으로 세팅
+                        var stateField = endTurnBtn.GetType().GetField("_state", AllInstance);
+                        if (stateField != null)
+                        {
+                            var stateEnumVal = Enum.ToObject(stateField.FieldType, 0); // State.Enabled = 0
+                            stateField.SetValue(endTurnBtn, stateEnumVal);
+                            ModEntry.Log("  NEndTurnButton._state = Enabled");
+                        }
+
+                        // 진단: RefreshEnabled 조건 로깅
+                        try
+                        {
+                            var combatRoomType = typeof(MegaCrit.Sts2.Core.Combat.CombatManager).Assembly
+                                .GetType("MegaCrit.Sts2.Core.Nodes.Rooms.NCombatRoom");
+                            var roomInstance = combatRoomType?.GetProperty("Instance",
+                                BindingFlags.Static | BindingFlags.Public)?.GetValue(null);
+                            if (roomInstance != null)
+                            {
+                                var roomMode = roomInstance.GetType().GetProperty("Mode", AllInstance)?.GetValue(roomInstance);
+                                ModEntry.Log($"  진단: NCombatRoom.Mode = {roomMode}");
+
+                                // ActiveScreenContext.Instance.IsCurrent(room)
+                                var ascType = typeof(MegaCrit.Sts2.Core.Combat.CombatManager).Assembly
+                                    .GetType("MegaCrit.Sts2.Core.Nodes.Screens.ScreenContext.ActiveScreenContext");
+                                var ascInstance = ascType?.GetProperty("Instance",
+                                    BindingFlags.Static | BindingFlags.Public)?.GetValue(null);
+                                if (ascInstance != null)
+                                {
+                                    var isCurrentMethod = ascInstance.GetType().GetMethod("IsCurrent", AllInstance);
+                                    if (isCurrentMethod != null)
+                                    {
+                                        var isCurrent = isCurrentMethod.Invoke(ascInstance, new object[] { roomInstance });
+                                        ModEntry.Log($"  진단: ActiveScreenContext.IsCurrent(NCombatRoom) = {isCurrent}");
+                                    }
+                                }
+
+                                // Hand.IsInCardSelection
+                                var uiProp = roomInstance.GetType().GetProperty("Ui", AllInstance);
+                                var ui = uiProp?.GetValue(roomInstance);
+                                var handProp = ui?.GetType().GetProperty("Hand", AllInstance);
+                                var handRef = handProp?.GetValue(ui);
+                                if (handRef != null)
+                                {
+                                    var inCardSelProp = handRef.GetType().GetProperty("IsInCardSelection", AllInstance);
+                                    var inCardSel = inCardSelProp?.GetValue(handRef);
+                                    ModEntry.Log($"  진단: Hand.IsInCardSelection = {inCardSel}");
+
+                                    var inCardPlayProp = handRef.GetType().GetProperty("InCardPlay", AllInstance);
+                                    var inCardPlay = inCardPlayProp?.GetValue(handRef);
+                                    ModEntry.Log($"  진단: Hand.InCardPlay = {inCardPlay}");
+
+                                    var curModeProp = handRef.GetType().GetProperty("CurrentMode", AllInstance);
+                                    var curMode = curModeProp?.GetValue(handRef);
+                                    ModEntry.Log($"  진단: Hand.CurrentMode = {curMode}");
+                                }
+                            }
+
+                            // NButton._isEnabled 확인
+                            var isEnabledField = endTurnBtn.GetType().GetField("_isEnabled", AllInstance);
+                            if (isEnabledField == null)
+                            {
+                                var bt = endTurnBtn.GetType().BaseType;
+                                while (bt != null && bt != typeof(Godot.Node))
+                                {
+                                    isEnabledField = bt.GetField("_isEnabled", AllInstance | BindingFlags.DeclaredOnly);
+                                    if (isEnabledField != null) break;
+                                    bt = bt.BaseType;
+                                }
+                            }
+                            ModEntry.Log($"  진단: NEndTurnButton._isEnabled = {isEnabledField?.GetValue(endTurnBtn)}");
+                        }
+                        catch (Exception diag)
+                        {
+                            ModEntry.Log($"  진단 실패: {diag.Message}");
+                        }
+
+                        // RefreshEnabled 호출하여 Enable/Disable 동기화
+                        var refreshMethod = endTurnBtn.GetType().GetMethod("RefreshEnabled", AllInstance);
+                        refreshMethod?.Invoke(endTurnBtn, null);
+
+                        // RefreshEnabled 호출 후 _isEnabled 재확인
+                        try
+                        {
+                            var isEnabledField2 = endTurnBtn.GetType().GetField("_isEnabled", AllInstance);
+                            if (isEnabledField2 == null)
+                            {
+                                var bt2 = endTurnBtn.GetType().BaseType;
+                                while (bt2 != null && bt2 != typeof(Godot.Node))
+                                {
+                                    isEnabledField2 = bt2.GetField("_isEnabled", AllInstance | BindingFlags.DeclaredOnly);
+                                    if (isEnabledField2 != null) break;
+                                    bt2 = bt2.BaseType;
+                                }
+                            }
+                            ModEntry.Log($"  NEndTurnButton RefreshEnabled 후 _isEnabled = {isEnabledField2?.GetValue(endTurnBtn)}");
+                        }
+                        catch { }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    ModEntry.Log($"  턴종료 상태 복원 실패 (무시): {ex.Message}");
+                }
+
                 // 핸드 카드 비주얼 갱신을 다음 프레임으로 지연 (현재 프레임에선 노드가 준비 안 됨)
                 _pendingHandRefresh = handNode;
                 var refreshTree = Godot.Engine.GetMainLoop() as Godot.SceneTree;
@@ -1416,46 +1823,50 @@ public class StateSnapshot
         var btn = FindNodeByType(root, btnTypeName);
         if (btn == null) return;
 
-        // 방법 1: 내부 카운트 필드 직접 설정
-        var countField = btn.GetType().GetField("_count", AllInstance)
-            ?? btn.GetType().GetField("_cardCount", AllInstance)
-            ?? btn.GetType().GetField("count", AllInstance);
-        // 부모 타입 필드도 검색
-        if (countField == null)
+        // 방법 1: _currentCount 필드 직접 설정 (NCombatCardPile 기본 클래스)
+        FieldInfo? countField = null;
+        var searchType = btn.GetType();
+        while (searchType != null && searchType != typeof(Godot.Node))
         {
-            var baseType = btn.GetType().BaseType;
-            while (baseType != null && baseType != typeof(Godot.Node))
-            {
-                countField = baseType.GetField("_count", AllInstance)
-                    ?? baseType.GetField("_cardCount", AllInstance)
-                    ?? baseType.GetField("count", AllInstance);
-                if (countField != null) break;
-                baseType = baseType.BaseType;
-            }
+            countField = searchType.GetField("_currentCount", AllInstance | BindingFlags.DeclaredOnly);
+            if (countField != null) break;
+            searchType = searchType.BaseType;
         }
 
         if (countField != null && countField.FieldType == typeof(int))
         {
             countField.SetValue(btn, targetCount);
-            ModEntry.Log($"  {name} 카운트 필드 직접 설정: {targetCount}");
+            ModEntry.Log($"  {name} _currentCount 설정: {targetCount}");
         }
 
-        // 방법 2: AddCard/RemoveCard로 차이 조정
-        int diff = targetCount - preCount;
-        if (diff != 0)
+        // 방법 2: _countLabel.SetTextAutoSize 호출로 라벨 텍스트 동기화
+        try
         {
-            var addCardMethod = btn.GetType().GetMethod("AddCard", AllInstance);
-            var removeCardMethod = btn.GetType().GetMethod("RemoveCard", AllInstance);
-
-            if (diff > 0 && addCardMethod != null)
-                for (int i = 0; i < diff; i++) addCardMethod.Invoke(btn, null);
-            else if (diff < 0 && removeCardMethod != null)
-                for (int i = 0; i < -diff; i++) removeCardMethod.Invoke(btn, null);
-
-            ModEntry.Log($"  {name} AddCard/RemoveCard: diff={diff}");
+            var labelField = btn.GetType().GetField("_countLabel", AllInstance);
+            if (labelField == null)
+            {
+                searchType = btn.GetType().BaseType;
+                while (searchType != null && searchType != typeof(Godot.Node))
+                {
+                    labelField = searchType.GetField("_countLabel", AllInstance | BindingFlags.DeclaredOnly);
+                    if (labelField != null) break;
+                    searchType = searchType.BaseType;
+                }
+            }
+            if (labelField != null)
+            {
+                var labelObj = labelField.GetValue(btn);
+                if (labelObj != null)
+                {
+                    var setTextMethod = labelObj.GetType().GetMethod("SetTextAutoSize", AllInstance);
+                    setTextMethod?.Invoke(labelObj, new object[] { targetCount.ToString() });
+                    ModEntry.Log($"  {name} _countLabel.SetTextAutoSize({targetCount})");
+                }
+            }
         }
+        catch { }
 
-        // 방법 3: Label 자식 찾아서 텍스트 직접 설정
+        // 방법 3 (폴백): Label 자식 찾아서 텍스트 직접 설정
         SetLabelRecursive(btn, targetCount.ToString(), name);
     }
 
@@ -1560,12 +1971,12 @@ public class StateSnapshot
                             if (powersList != null && !powersList.Contains(savedPower.PowerRef))
                             {
                                 powersList.Add(savedPower.PowerRef);
-                                // PowerApplied 이벤트 발생 (NPowerContainer가 듣고 있으면 UI 갱신)
+                                // PowerApplied 이벤트 발생 → NPowerContainer가 NPower UI 노드 생성
                                 try
                                 {
-                                    creature.GetType().GetField("PowerApplied", AllInstance)?
-                                        .GetValue(creature);
-                                    // 이벤트 직접 호출은 복잡하므로 생략 — AddCreature가 새 노드를 만들어 처리
+                                    var paField = creature.GetType().GetField("PowerApplied", AllInstance);
+                                    var handler = paField?.GetValue(creature) as Action<PowerModel>;
+                                    handler?.Invoke(savedPower.PowerRef);
                                 }
                                 catch { }
                                 ModEntry.Log($"    파워 직접 추가: {powerId} = {amount}");
@@ -1809,10 +2220,41 @@ public class StateSnapshot
                     var reloadMethod = newNCard.GetType().GetMethod("Reload", AllInstance);
                     reloadMethod?.Invoke(newNCard, null);
 
-                    // 원래 인덱스에 추가 (현재 자식 수 초과 시 클램프)
+                    // 원래 인덱스에 추가 (씬 트리에 들어가야 _Ready 실행됨)
                     int insertIdx = Math.Min(originalIndex, containerNode.GetChildCount());
                     addMethod.Invoke(handNode, new object[] { newNCard, insertIdx });
                     ModEntry.Log($"    카드 추가 성공: {missing.CardRef?.Id.Entry} at index {insertIdx} (원래 {originalIndex})");
+
+                    // 씬 트리 추가 후: SubscribeToModel 재호출 (이제 IsInsideTree()=true)
+                    try
+                    {
+                        var subModelPost = newNCard.GetType().GetMethod("SubscribeToModel", AllInstance);
+                        subModelPost?.Invoke(newNCard, new object[] { missing.CardRef! });
+
+                        // UpdateVisuals(PileType.Hand, CardPreviewMode.Normal) 호출
+                        var updateVisuals = newNCard.GetType().GetMethod("UpdateVisuals", AllInstance);
+                        if (updateVisuals != null)
+                        {
+                            // PileType.Hand enum 값 찾기
+                            var pileTypeEnum = typeof(CardModel).Assembly.GetType("MegaCrit.Sts2.Core.Entities.Cards.PileType");
+                            if (pileTypeEnum != null)
+                            {
+                                var handVal = Enum.Parse(pileTypeEnum, "Hand");
+                                var previewModeEnum = typeof(CardModel).Assembly.GetType("MegaCrit.Sts2.Core.Nodes.Cards.CardPreviewMode");
+                                if (previewModeEnum != null)
+                                {
+                                    var normalVal = Enum.Parse(previewModeEnum, "Normal");
+                                    updateVisuals.Invoke(newNCard, new object[] { handVal, normalVal });
+                                }
+                            }
+                        }
+                        if (missing.CardRef!.Enchantment != null)
+                            ModEntry.Log($"    인챈트 비주얼 설정: {missing.CardRef.Enchantment.Id.Entry}");
+                    }
+                    catch (Exception enchEx)
+                    {
+                        ModEntry.Log($"    트리 후 구독/비주얼 실패: {enchEx.InnerException?.Message ?? enchEx.Message}");
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -2438,6 +2880,59 @@ public class StateSnapshot
         }
 
         ModEntry.Log($"    유물 카운터 필드를 찾지 못함: {relicType.Name}");
+    }
+
+    /// <summary>유물별 추가 bool/int 필드를 캡처 (턴 중 변경되는 내부 상태)</summary>
+    private static void CaptureRelicExtraFields(RelicModel relic, RelicSnapshot rs)
+    {
+        try
+        {
+            // 유물의 concrete 타입에서 private bool/int 필드를 모두 캡처
+            var relicType = relic.GetType();
+            foreach (var f in relicType.GetFields(AllInstance | BindingFlags.DeclaredOnly))
+            {
+                if (f.FieldType == typeof(bool))
+                {
+                    rs.ExtraFields[f.Name] = (bool)f.GetValue(relic)!;
+                }
+                else if (f.FieldType == typeof(int) && f.Name != rs.CounterFieldName)
+                {
+                    rs.ExtraFields[f.Name] = (int)f.GetValue(relic)!;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            ModEntry.Log($"  유물 추가 필드 캡처 실패 ({rs.Id}): {ex.Message}");
+        }
+    }
+
+    /// <summary>유물별 추가 필드를 복원</summary>
+    private static void RestoreRelicExtraFields(RelicSnapshot rs)
+    {
+        if (rs.RelicRef == null || rs.ExtraFields.Count == 0) return;
+        var relic = rs.RelicRef;
+        var relicType = relic.GetType();
+
+        foreach (var kvp in rs.ExtraFields)
+        {
+            try
+            {
+                var field = relicType.GetField(kvp.Key, AllInstance | BindingFlags.DeclaredOnly);
+                if (field == null) continue;
+
+                var currentVal = field.GetValue(relic);
+                if (!Equals(currentVal, kvp.Value))
+                {
+                    field.SetValue(relic, kvp.Value);
+                    ModEntry.Log($"  유물 필드 복원: {rs.Id}.{kvp.Key} = {currentVal} → {kvp.Value}");
+                }
+            }
+            catch (Exception ex)
+            {
+                ModEntry.Log($"  유물 필드 복원 실패 ({rs.Id}.{kvp.Key}): {ex.Message}");
+            }
+        }
     }
 
     private static void InvokeRelicDisplayChanged(RelicModel relic)
