@@ -1489,6 +1489,49 @@ public class StateSnapshot
                 ModEntry.Log($"  핸드 카드 정렬 실패: {ex.Message}");
             }
 
+            // 모든 크리처의 NPowerContainer UI 강제 갱신
+            try
+            {
+                var tree = Godot.Engine.GetMainLoop() as Godot.SceneTree;
+                if (tree?.Root != null)
+                {
+                    var combatRoomNode = FindNodeByType(tree.Root, "NCombatRoom");
+                    if (combatRoomNode != null)
+                    {
+                        // 모든 NCreature 노드에서 NPowerContainer.RefreshAll 호출
+                        var creatureNodesField = combatRoomNode.GetType().GetField("_creatureNodes", AllInstance);
+                        if (creatureNodesField?.GetValue(combatRoomNode) is System.Collections.IList creatureNodes)
+                        {
+                            foreach (var cn in creatureNodes)
+                            {
+                                if (cn is not Godot.Node cNode || !Godot.GodotObject.IsInstanceValid(cNode)) continue;
+                                try
+                                {
+                                    // NCreature → NPowerContainer
+                                    var powerContainerProp = cNode.GetType().GetProperty("PowerContainer", AllInstance);
+                                    var powerContainer = powerContainerProp?.GetValue(cNode) as Godot.Node;
+                                    if (powerContainer != null)
+                                    {
+                                        var refreshAll = powerContainer.GetType().GetMethod("RefreshAll", AllInstance);
+                                        refreshAll?.Invoke(powerContainer, null);
+                                    }
+
+                                    // NCreature → NHealthBar 갱신
+                                    var refreshHealth = cNode.GetType().GetMethod("RefreshHealth", AllInstance)
+                                        ?? cNode.GetType().GetMethod("UpdateHealth", AllInstance);
+                                    refreshHealth?.Invoke(cNode, null);
+                                }
+                                catch { }
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                ModEntry.Log($"  NPowerContainer 갱신 실패: {ex.Message}");
+            }
+
             // === 진단 덤프: 복원 후 전체 시스템 상태 ===
             DumpSystemState("Restore 완료 후", state, crossTurn);
 
@@ -2793,8 +2836,25 @@ public class StateSnapshot
                 {
                     if (power.Amount != savedSnap.Amount)
                     {
-                        SetProperty(power, "Amount", savedSnap.Amount);
-                        ModEntry.Log($"    파워 수량 복원: {id} → {savedSnap.Amount}");
+                        // _amount 필드 직접 설정 (SetProperty는 setter 없으면 실패할 수 있음)
+                        var amountField = FindFieldInHierarchy(power.GetType(), "_amount");
+                        if (amountField != null)
+                        {
+                            amountField.SetValue(power, savedSnap.Amount);
+                        }
+                        else
+                        {
+                            SetProperty(power, "Amount", savedSnap.Amount);
+                        }
+                        // AmountChanged 이벤트 발화 → NPower UI 갱신
+                        try
+                        {
+                            var amountChangedField = FindField(power.GetType(), "AmountChanged");
+                            var handler = amountChangedField?.GetValue(power) as Action;
+                            handler?.Invoke();
+                        }
+                        catch { }
+                        ModEntry.Log($"    파워 수량 복원: {id} {power.Amount} → {savedSnap.Amount}");
                     }
                     // _internalData 내부 필드 복원 (자동화 cardsLeft 등)
                     RestorePowerInternalData(power, savedSnap);
