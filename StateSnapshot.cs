@@ -127,6 +127,7 @@ public class StateSnapshot
         public int Amount;
         public PowerModel? PowerRef;  // 원본 파워 참조 (죽은 적 복원용)
         public Dictionary<string, object?> InternalDataFields = new();  // _internalData 내부 필드 캡처
+        public object? InternalDataClone;  // _internalData의 MemberwiseClone (원자적 복원용)
     }
 
     public class PetSnapshot
@@ -261,8 +262,9 @@ public class StateSnapshot
                 {
                     var ps = new PowerSnapshot { Id = p.Id.Entry, Amount = p.Amount, PowerRef = p };
                     CapturePowerInternalData(p, ps);
-                    if (ps.InternalDataFields.Count > 0)
-                        ModEntry.Log($"    적 파워 캡처: {enemy.Name}.{ps.Id} Amount={ps.Amount}, fields=[{string.Join(", ", ps.InternalDataFields.Select(kv => $"{kv.Key}={kv.Value}"))}]");
+                    ModEntry.Log($"    적 파워 캡처: {enemy.Name}.{ps.Id} Amount={ps.Amount}" +
+                        (ps.InternalDataClone != null ? " [internalData cloned]" : "") +
+                        (ps.InternalDataFields.Count > 0 ? $" fields=[{string.Join(", ", ps.InternalDataFields.Select(kv => $"{kv.Key}={kv.Value}"))}]" : ""));
                     es.Powers.Add(ps);
                 }
                 // NextMove 저장
@@ -2836,16 +2838,44 @@ public class StateSnapshot
                 {
                     if (power.Amount != savedSnap.Amount)
                     {
-                        // _amount 필드 직접 설정 (SetProperty는 setter 없으면 실패할 수 있음)
-                        var amountField = FindFieldInHierarchy(power.GetType(), "_amount");
-                        if (amountField != null)
+                        int beforeAmount = power.Amount;
+                        bool amountSet = false;
+
+                        // 1) _amount 필드 직접 설정
+                        foreach (var fname in new[] { "_amount", "_Amount", "amount" })
                         {
-                            amountField.SetValue(power, savedSnap.Amount);
+                            var af = FindFieldInHierarchy(power.GetType(), fname);
+                            if (af != null)
+                            {
+                                af.SetValue(power, savedSnap.Amount);
+                                amountSet = true;
+                                ModEntry.Log($"    파워 Amount 필드 '{fname}' 설정: {id} {beforeAmount} → {savedSnap.Amount} (실제: {power.Amount})");
+                                break;
+                            }
                         }
-                        else
+
+                        // 2) 필드 못 찾으면 프로퍼티 setter 시도
+                        if (!amountSet || power.Amount != savedSnap.Amount)
                         {
-                            SetProperty(power, "Amount", savedSnap.Amount);
+                            try
+                            {
+                                SetProperty(power, "Amount", savedSnap.Amount);
+                                ModEntry.Log($"    파워 Amount 프로퍼티 설정: {id} → {savedSnap.Amount} (실제: {power.Amount})");
+                            }
+                            catch { }
                         }
+
+                        // 3) backing field 패턴 시도 (<Amount>k__BackingField)
+                        if (power.Amount != savedSnap.Amount)
+                        {
+                            var backingField = FindFieldInHierarchy(power.GetType(), "<Amount>k__BackingField");
+                            if (backingField != null)
+                            {
+                                backingField.SetValue(power, savedSnap.Amount);
+                                ModEntry.Log($"    파워 Amount backing field 설정: {id} → {savedSnap.Amount} (실제: {power.Amount})");
+                            }
+                        }
+
                         // AmountChanged 이벤트 발화 → NPower UI 갱신
                         try
                         {
@@ -2854,7 +2884,8 @@ public class StateSnapshot
                             handler?.Invoke();
                         }
                         catch { }
-                        ModEntry.Log($"    파워 수량 복원: {id} {power.Amount} → {savedSnap.Amount}");
+
+                        ModEntry.Log($"    파워 수량 복원 결과: {id} {beforeAmount} → {savedSnap.Amount} (최종: {power.Amount})");
                     }
                     // _internalData 내부 필드 복원 (자동화 cardsLeft 등)
                     RestorePowerInternalData(power, savedSnap);
@@ -4178,6 +4209,15 @@ public class StateSnapshot
             var data = dataField.GetValue(power);
             if (data == null) return;
 
+            // MemberwiseClone으로 _internalData 원자적 복사 (참고 레포 방식)
+            try
+            {
+                var cloneMethod = data.GetType().GetMethod("MemberwiseClone", AllInstance);
+                if (cloneMethod != null)
+                    ps.InternalDataClone = cloneMethod.Invoke(data, null);
+            }
+            catch { }
+
             var dataType = data.GetType();
             foreach (var f in dataType.GetFields(AllInstance | BindingFlags.DeclaredOnly))
             {
@@ -4220,39 +4260,37 @@ public class StateSnapshot
     /// <summary>파워의 _internalData 내부 필드 + 서브클래스 고유 필드를 복원</summary>
     private static void RestorePowerInternalData(PowerModel power, PowerSnapshot ps)
     {
-        if (ps.InternalDataFields.Count == 0) return;
         try
         {
             var dataField = typeof(PowerModel).GetField("_internalData", AllInstance);
-            var data = dataField?.GetValue(power);
 
-            foreach (var kvp in ps.InternalDataFields)
+            // MemberwiseClone 원자적 복원 (최우선)
+            if (ps.InternalDataClone != null && dataField != null)
             {
-                if (kvp.Key.StartsWith("__sub_"))
+                try
                 {
-                    // 서브클래스 고유 필드 복원
-                    var fieldName = kvp.Key.Substring(6); // "__sub_" 제거
-                    var f = FindFieldInHierarchy(power.GetType(), fieldName);
-                    if (f != null && kvp.Value != null)
+                    // 스냅샷 보호를 위해 클론의 클론을 사용
+                    var cloneMethod = ps.InternalDataClone.GetType().GetMethod("MemberwiseClone", AllInstance);
+                    var freshClone = cloneMethod?.Invoke(ps.InternalDataClone, null);
+                    if (freshClone != null)
                     {
-                        try
-                        {
-                            var currentVal = f.GetValue(power);
-                            if (!Equals(currentVal, kvp.Value))
-                            {
-                                f.SetValue(power, Convert.ChangeType(kvp.Value, f.FieldType));
-                                ModEntry.Log($"    파워 서브필드 복원: {ps.Id}.{fieldName} = {currentVal} → {kvp.Value}");
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            ModEntry.Log($"    파워 서브필드 복원 실패: {ps.Id}.{fieldName}: {ex.Message}");
-                        }
+                        dataField.SetValue(power, freshClone);
+                        ModEntry.Log($"    파워 _internalData MemberwiseClone 복원: {ps.Id}");
                     }
                 }
-                else if (data != null)
+                catch (Exception ex)
                 {
-                    // _internalData 필드 복원
+                    ModEntry.Log($"    파워 _internalData 클론 복원 실패 ({ps.Id}): {ex.Message}");
+                }
+            }
+            else if (ps.InternalDataFields.Count > 0)
+            {
+                // 클론이 없을 경우 필드별 복원 (폴백)
+                var data = dataField?.GetValue(power);
+                foreach (var kvp in ps.InternalDataFields)
+                {
+                    if (kvp.Key.StartsWith("__sub_")) continue;  // 서브클래스는 아래에서 별도 처리
+                    if (data == null) continue;
                     var dataType = data.GetType();
                     var f = dataType.GetField(kvp.Key, AllInstance | BindingFlags.DeclaredOnly);
                     if (f == null) continue;
@@ -4265,12 +4303,43 @@ public class StateSnapshot
                 }
             }
 
-            // DisplayAmount 갱신
+            // 서브클래스 고유 필드 복원
+            foreach (var kvp in ps.InternalDataFields)
+            {
+                if (!kvp.Key.StartsWith("__sub_")) continue;
+                var fieldName = kvp.Key.Substring(6);
+                var f = FindFieldInHierarchy(power.GetType(), fieldName);
+                if (f != null && kvp.Value != null)
+                {
+                    try
+                    {
+                        var currentVal = f.GetValue(power);
+                        if (!Equals(currentVal, kvp.Value))
+                        {
+                            f.SetValue(power, Convert.ChangeType(kvp.Value, f.FieldType));
+                            ModEntry.Log($"    파워 서브필드 복원: {ps.Id}.{fieldName} = {currentVal} → {kvp.Value}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        ModEntry.Log($"    파워 서브필드 복원 실패: {ps.Id}.{fieldName}: {ex.Message}");
+                    }
+                }
+            }
+
+            // DisplayAmount + AmountChanged 갱신
             try
             {
                 var evt = typeof(PowerModel).GetField("DisplayAmountChanged", AllInstance);
                 var handler = evt?.GetValue(power) as Action;
                 handler?.Invoke();
+            }
+            catch { }
+            try
+            {
+                var evt2 = typeof(PowerModel).GetField("AmountChanged", AllInstance);
+                var handler2 = evt2?.GetValue(power) as Action;
+                handler2?.Invoke();
             }
             catch { }
         }
