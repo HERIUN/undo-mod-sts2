@@ -104,6 +104,8 @@ public class StateSnapshot
         public int EnchantmentStatusVal;    // _status enum 값 (캡처 시점)
         public object? EnchantmentRef;       // 원본 EnchantmentModel 참조
         public Dictionary<string, object?> EnchantmentExtraFields = new(); // 서브클래스 고유 필드 (기세 _extraDamage 등)
+        public object? DynamicVarsClone;    // CardModel.DynamicVars의 MemberwiseClone (유전 알고리즘 등 누적 수치)
+        public Dictionary<string, object?>? SubclassFields;  // CardModel 서브클래스 고유 필드 (int/bool/decimal)
     }
 
     // 핸드 카드의 NHandCardHolder 레퍼런스 저장
@@ -212,7 +214,7 @@ public class StateSnapshot
                         if (hn != null) DumpNodeTree(hn, 0, 3);
                     }
 
-                    // CardHolderContainer에서 홀더 수집
+                    // CardHolderContainer에서 홀더 수집 + NCard 씬 경로 캐시
                     var cardHolderContainer = FindNodeByName(tree.Root, "CardHolderContainer");
                     if (cardHolderContainer != null)
                     {
@@ -221,6 +223,16 @@ public class StateSnapshot
                             var child = cardHolderContainer.GetChild(i);
                             if (child.GetType().Name == "NHandCardHolder")
                                 snap.HandHolders.Add(child);
+                        }
+                        // NCard 씬 경로를 캐시 (핸드에 카드가 있을 때 항상 갱신)
+                        if (_cachedNCardScenePath == null)
+                        {
+                            var ncard = FindNodeByType(cardHolderContainer, "NCard");
+                            if (ncard != null && !string.IsNullOrEmpty(ncard.SceneFilePath))
+                            {
+                                _cachedNCardScenePath = ncard.SceneFilePath;
+                                _cachedNCardType = ncard.GetType();
+                            }
                         }
                     }
 
@@ -1061,6 +1073,12 @@ public class StateSnapshot
             RestoreCardCostModifiers(DiscardPile);
             RestoreCardCostModifiers(ExhaustPile);
 
+            // 카드 DynamicVars + 서브클래스 필드 복원 (유전 알고리즘 등 누적 수치)
+            RestoreCardDynamicState(Hand);
+            RestoreCardDynamicState(DrawPile);
+            RestoreCardDynamicState(DiscardPile);
+            RestoreCardDynamicState(ExhaustPile);
+
             // 플레이어 파워 복원
             RestorePowers(creature, PlayerPowers);
 
@@ -1547,10 +1565,54 @@ public class StateSnapshot
         }
     }
 
+    private static bool _cardFieldsDumped;
     private static List<CardSnapshot> CaptureCards(CardPile? pile)
     {
         if (pile == null) return new();
         return pile.Cards.Select(c => {
+            // CardModel 내부 구조 진단 (첫 번째 카드 1회)
+            if (!_cardFieldsDumped)
+            {
+                _cardFieldsDumped = true;
+                ModEntry.Log($"=== CardModel 진단: {c.Id.Entry} (타입: {c.GetType().FullName}) ===");
+                var t = c.GetType();
+                while (t != null && t != typeof(object))
+                {
+                    ModEntry.Log($"  --- {t.Name} 필드 ---");
+                    foreach (var f in t.GetFields(AllInstance | BindingFlags.DeclaredOnly))
+                    {
+                        try { ModEntry.Log($"    F: {f.Name} : {f.FieldType.Name} = {f.GetValue(c)}"); }
+                        catch { ModEntry.Log($"    F: {f.Name} : {f.FieldType.Name} = (읽기 실패)"); }
+                    }
+                    t = t.BaseType;
+                }
+                foreach (var p in c.GetType().GetProperties(AllInstance))
+                {
+                    try
+                    {
+                        if (p.CanRead && (p.PropertyType == typeof(int) || p.PropertyType == typeof(decimal)
+                            || p.PropertyType == typeof(bool) || p.PropertyType == typeof(float)))
+                            ModEntry.Log($"    P: {p.Name} : {p.PropertyType.Name} = {p.GetValue(c)}");
+                    }
+                    catch { }
+                }
+                try
+                {
+                    var dvProp = c.GetType().GetProperty("DynamicVars", AllInstance);
+                    var dv = dvProp?.GetValue(c);
+                    ModEntry.Log($"    DynamicVars = {(dv == null ? "null" : dv.GetType().FullName)}");
+                    if (dv != null)
+                    {
+                        foreach (var f in dv.GetType().GetFields(AllInstance))
+                        {
+                            try { ModEntry.Log($"      DV.{f.Name} : {f.FieldType.Name} = {f.GetValue(dv)}"); }
+                            catch { }
+                        }
+                    }
+                }
+                catch { }
+                ModEntry.Log("=== CardModel 진단 끝 ===");
+            }
             var cs = new CardSnapshot
             {
                 Id = c.Id.Entry,
@@ -1656,6 +1718,79 @@ public class StateSnapshot
                     ModEntry.Log($"    인챈트 필드 읽기 실패 ({cs.Id}): {ex.Message}");
                 }
             }
+            // DynamicVars 딥카피 (유전 알고리즘 등 누적 수치)
+            // MemberwiseClone은 얕은 복사라서 _vars Dictionary를 공유함 → 딥카피 필요
+            try
+            {
+                var dvField = typeof(CardModel).GetField("_dynamicVars", AllInstance);
+                var dv = dvField?.GetValue(c);
+                if (dv != null)
+                {
+                    // 1) DynamicVarSet를 MemberwiseClone
+                    var cloneMethod = dv.GetType().GetMethod("MemberwiseClone",
+                        BindingFlags.Instance | BindingFlags.NonPublic);
+                    var dvClone = cloneMethod?.Invoke(dv, null);
+                    if (dvClone != null)
+                    {
+                        // 2) _vars Dictionary를 딥카피
+                        var varsField = dv.GetType().GetField("_vars", AllInstance);
+                        var origDict = varsField?.GetValue(dv) as System.Collections.IDictionary;
+                        if (origDict != null && varsField != null)
+                        {
+                            // 새 Dictionary 생성 (같은 타입)
+                            var newDict = Activator.CreateInstance(origDict.GetType()) as System.Collections.IDictionary;
+                            if (newDict != null)
+                            {
+                                foreach (System.Collections.DictionaryEntry entry in origDict)
+                                {
+                                    // 각 DynamicVar도 MemberwiseClone
+                                    object? clonedVal = entry.Value;
+                                    if (clonedVal != null)
+                                    {
+                                        try
+                                        {
+                                            var valCloneMethod = clonedVal.GetType().GetMethod("MemberwiseClone",
+                                                BindingFlags.Instance | BindingFlags.NonPublic);
+                                            clonedVal = valCloneMethod?.Invoke(clonedVal, null) ?? clonedVal;
+                                        }
+                                        catch { }
+                                    }
+                                    newDict[entry.Key] = clonedVal;
+                                }
+                                varsField.SetValue(dvClone, newDict);
+                            }
+                        }
+                        cs.DynamicVarsClone = dvClone;
+                    }
+                }
+            }
+            catch { }
+            // CardModel 전체 계층 필드 캡처 (base 포함 — 유전 알고리즘 등 누적 수치)
+            try
+            {
+                var cardType = c.GetType();
+                var st = cardType;
+                // CardModel 포함, object 직전까지 전부 캡처
+                while (st != null && st != typeof(object))
+                {
+                    foreach (var f in st.GetFields(AllInstance | BindingFlags.DeclaredOnly))
+                    {
+                        try
+                        {
+                            // 이벤트/델리게이트/참조 타입은 제외, 값 타입만
+                            var val = f.GetValue(c);
+                            if (val is int || val is decimal || val is bool || val is float || val is double)
+                            {
+                                cs.SubclassFields ??= new();
+                                cs.SubclassFields[f.Name] = val;
+                            }
+                        }
+                        catch { }
+                    }
+                    st = st.BaseType;
+                }
+            }
+            catch { }
             return cs;
         }).ToList();
     }
@@ -2261,6 +2396,99 @@ public class StateSnapshot
             catch (Exception ex)
             {
                 ModEntry.Log($"    카드 비용 복원 실패 ({cs.Id}): {ex.InnerException?.Message ?? ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>카드 DynamicVars + 서브클래스 필드 복원 (유전 알고리즘 등 누적 수치)</summary>
+    private static void RestoreCardDynamicState(List<CardSnapshot> snapshots)
+    {
+        foreach (var cs in snapshots)
+        {
+            if (cs.CardRef == null) continue;
+
+            // DynamicVars 딥카피 복원 (_dynamicVars 필드 직접 접근)
+            try
+            {
+                var dvField = typeof(CardModel).GetField("_dynamicVars", AllInstance);
+                if (dvField != null)
+                {
+                    var currentDv = dvField.GetValue(cs.CardRef);
+
+                    if (cs.DynamicVarsClone != null)
+                    {
+                        // 스냅샷 보호를 위해 다시 딥카피
+                        var cloneMethod = cs.DynamicVarsClone.GetType().GetMethod("MemberwiseClone",
+                            BindingFlags.Instance | BindingFlags.NonPublic);
+                        var freshClone = cloneMethod?.Invoke(cs.DynamicVarsClone, null);
+                        if (freshClone != null)
+                        {
+                            // _vars Dictionary도 딥카피
+                            var varsField = cs.DynamicVarsClone.GetType().GetField("_vars", AllInstance);
+                            var origDict = varsField?.GetValue(cs.DynamicVarsClone) as System.Collections.IDictionary;
+                            if (origDict != null && varsField != null)
+                            {
+                                var newDict = Activator.CreateInstance(origDict.GetType()) as System.Collections.IDictionary;
+                                if (newDict != null)
+                                {
+                                    foreach (System.Collections.DictionaryEntry entry in origDict)
+                                    {
+                                        object? clonedVal = entry.Value;
+                                        if (clonedVal != null)
+                                        {
+                                            try
+                                            {
+                                                var valClone = clonedVal.GetType().GetMethod("MemberwiseClone",
+                                                    BindingFlags.Instance | BindingFlags.NonPublic);
+                                                clonedVal = valClone?.Invoke(clonedVal, null) ?? clonedVal;
+                                            }
+                                            catch { }
+                                        }
+                                        newDict[entry.Key] = clonedVal;
+                                    }
+                                    varsField.SetValue(freshClone, newDict);
+                                }
+                            }
+                            dvField.SetValue(cs.CardRef, freshClone);
+                            ModEntry.Log($"    카드 DynamicVars 딥카피 복원: {cs.Id}");
+                        }
+                    }
+                    else if (currentDv != null)
+                    {
+                        // 스냅샷 시점에 null이었으면 null로 되돌리기
+                        dvField.SetValue(cs.CardRef, null);
+                        ModEntry.Log($"    카드 DynamicVars null로 복원: {cs.Id}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                ModEntry.Log($"    카드 DynamicVars 복원 실패 ({cs.Id}): {ex.Message}");
+            }
+
+            // 서브클래스 고유 필드 복원
+            if (cs.SubclassFields != null && cs.SubclassFields.Count > 0)
+            {
+                foreach (var kvp in cs.SubclassFields)
+                {
+                    try
+                    {
+                        var f = FindFieldInHierarchy(cs.CardRef.GetType(), kvp.Key);
+                        if (f != null && kvp.Value != null)
+                        {
+                            var currentVal = f.GetValue(cs.CardRef);
+                            if (!Equals(currentVal, kvp.Value))
+                            {
+                                f.SetValue(cs.CardRef, Convert.ChangeType(kvp.Value, f.FieldType));
+                                ModEntry.Log($"    카드 서브필드 복원: {cs.Id}.{kvp.Key} = {currentVal} → {kvp.Value}");
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        ModEntry.Log($"    카드 서브필드 복원 실패 ({cs.Id}.{kvp.Key}): {ex.Message}");
+                    }
+                }
             }
         }
     }
@@ -3308,24 +3536,31 @@ public class StateSnapshot
                 {
                     if (savedHand[i].CardRef != null)
                     {
-                        // HasBeenRemovedFromState 리셋
                         try
                         {
-                            var removedProp = savedHand[i].CardRef.GetType().GetProperty("HasBeenRemovedFromState", AllInstance);
-                            if (removedProp != null && removedProp.CanWrite)
+                            // HasBeenRemovedFromState 리셋
+                            try
                             {
-                                if ((bool)(removedProp.GetValue(savedHand[i].CardRef) ?? false))
-                                    removedProp.SetValue(savedHand[i].CardRef, false);
+                                var removedProp = savedHand[i].CardRef.GetType().GetProperty("HasBeenRemovedFromState", AllInstance);
+                                if (removedProp != null && removedProp.CanWrite)
+                                {
+                                    if ((bool)(removedProp.GetValue(savedHand[i].CardRef) ?? false))
+                                        removedProp.SetValue(savedHand[i].CardRef, false);
+                                }
                             }
+                            catch { }
+                            cardsList.Add(savedHand[i].CardRef);
+                            try
+                            {
+                                if (CombatManager.Instance?.IsInProgress == true)
+                                    CombatManager.Instance.StateTracker?.Subscribe(savedHand[i].CardRef);
+                            }
+                            catch { }
                         }
-                        catch { }
-                        cardsList.Add(savedHand[i].CardRef);
-                        try
+                        catch (Exception ex)
                         {
-                            if (CombatManager.Instance?.IsInProgress == true)
-                                CombatManager.Instance.StateTracker?.Subscribe(savedHand[i].CardRef);
+                            ModEntry.Log($"  핸드 카드 추가 실패 [{i}] {savedHand[i].Id}: {ex.Message}");
                         }
-                        catch { }
                     }
                 }
             }
@@ -3453,10 +3688,24 @@ public class StateSnapshot
 
             if (missingCards.Count == 0) return;
 
-            // NCard 씬 경로 찾기
+            // NCard 씬 경로 찾기 (캐시 우선, 없으면 기존 NCard에서 추출)
             var existingCard = FindNodeByType(containerNode, "NCard");
             string? scenePath = existingCard?.SceneFilePath;
             var nCardType = existingCard?.GetType();
+
+            // 캐시에 저장
+            if (!string.IsNullOrEmpty(scenePath) && nCardType != null)
+            {
+                _cachedNCardScenePath = scenePath;
+                _cachedNCardType = nCardType;
+            }
+            // 현재 컨테이너에 NCard가 없으면 캐시 사용
+            else if (!string.IsNullOrEmpty(_cachedNCardScenePath))
+            {
+                scenePath = _cachedNCardScenePath;
+                nCardType = _cachedNCardType;
+                ModEntry.Log("  NCard 씬 경로를 캐시에서 사용");
+            }
 
             if (string.IsNullOrEmpty(scenePath) || nCardType == null)
             {
@@ -3474,8 +3723,29 @@ public class StateSnapshot
                 return;
             }
 
-            // NPlayerHand.Add 메서드
-            var addMethod = handNode.GetType().GetMethod("Add", AllInstance);
+            // NPlayerHand.Add 메서드 (AmbiguousMatchException 방지)
+            System.Reflection.MethodInfo? addMethod = null;
+            try
+            {
+                addMethod = handNode.GetType().GetMethod("Add", AllInstance);
+            }
+            catch (System.Reflection.AmbiguousMatchException)
+            {
+                // 오버로드가 여러 개면 NCard + int 시그니처 찾기
+                var addMethods = handNode.GetType().GetMethods(AllInstance)
+                    .Where(m => m.Name == "Add").ToArray();
+                foreach (var m in addMethods)
+                {
+                    var parms = m.GetParameters();
+                    if (parms.Length == 2 && parms[1].ParameterType == typeof(int))
+                    {
+                        addMethod = m;
+                        break;
+                    }
+                }
+                addMethod ??= addMethods.FirstOrDefault();
+                ModEntry.Log($"  Add 오버로드 {addMethods.Length}개 중 선택: {addMethod?.GetParameters().Length ?? -1} 파라미터");
+            }
             if (addMethod == null)
             {
                 ModEntry.Log("  NPlayerHand.Add 메서드 없음");
@@ -3517,7 +3787,13 @@ public class StateSnapshot
 
                     // 원래 인덱스에 추가 (씬 트리에 들어가야 _Ready 실행됨)
                     int insertIdx = Math.Min(originalIndex, containerNode.GetChildCount());
-                    addMethod.Invoke(handNode, new object[] { newNCard, insertIdx });
+                    var addParams = addMethod.GetParameters();
+                    if (addParams.Length == 2)
+                        addMethod.Invoke(handNode, new object[] { newNCard, insertIdx });
+                    else if (addParams.Length == 1)
+                        addMethod.Invoke(handNode, new object[] { newNCard });
+                    else
+                        addMethod.Invoke(handNode, new object[] { newNCard, insertIdx });
                     ModEntry.Log($"    카드 추가 성공: {missing.CardRef?.Id.Entry} at index {insertIdx} (원래 {originalIndex})");
 
                     // 씬 트리 추가 후: SubscribeToModel 재호출 (이제 IsInsideTree()=true)
@@ -3741,6 +4017,8 @@ public class StateSnapshot
     private static bool _nCardLogged;
     private static bool _pickerLogged;
     private static bool _handTreeLogged;
+    private static string? _cachedNCardScenePath;
+    private static Type? _cachedNCardType;
 
     private static Godot.Node? FindNodeByType(Godot.Node root, string typeName)
     {
