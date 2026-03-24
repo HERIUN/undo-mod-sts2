@@ -116,17 +116,20 @@ print(f"Undo 결과: {undo()}")
 | 에너지 비용 | 기본 비용(_base) + 비용 수정자(_localModifiers) |
 | 구속 (Affliction) | 종류(Id), 카테고리, 수치 (예: Bound, Hexed) |
 | 인챈트 (Enchantment) | 종류(Id), 카테고리, 수치(_amount), 상태(_status), 서브클래스 고유 필드 (기세 _extraDamage 등) |
+| DynamicVars | 딥카피 — 유전 알고리즘 등 누적 수치 완전 복원 |
+| 서브클래스 필드 | CardModel 전체 계층의 int/bool/decimal 필드 |
 
 ### 적 상태
 
 | 항목 | 세부 내용 |
 |------|-----------|
 | HP/블록 | 각 적의 현재 HP, 최대 HP, 블록 |
-| 생존 여부 | IsAlive — 죽은 적도 부활 가능 |
-| 버프/디버프 | 모든 파워의 종류, 수치, 내부 데이터 |
+| 생존 여부 | IsAlive — 죽은 적도 원래 위치에 부활 |
+| 버프/디버프 | 모든 파워의 종류, 수치, _internalData (MemberwiseClone 딥카피) |
 | 다음 행동 (Intent) | Monster.NextMove 상태 (SetMoveImmediate로 복원) |
 | 소환된 적 | 스냅샷에 없는 소환 적은 자동 제거 |
 | 도주 크리처 | _escapedCreatures 리스트 |
+| 화면 위치 | NCreature 노드의 원래 Position 저장/복원 |
 
 ### 펫 상태
 
@@ -167,7 +170,7 @@ print(f"Undo 결과: {undo()}")
 | RNG 상태 | RunRng, PlayerRng, MonsterRng — seed + counter로 랜덤 결과 동기화 |
 | 전투 기록 | History 엔트리 수 (스냅샷 이후 추가된 항목 제거) |
 | 턴 플래그 | IsPlayPhase, EndingPlayerTurnPhaseOne/Two, IsEnemyTurnStarted, PlayerActionsDisabled 등 |
-| ActionQueueSynchronizer | PlayPhase 전환 + ActionExecutor Unpause |
+| ActionQueueSynchronizer | PlayPhase 전환 (enum 타입 동적 감지) + ActionExecutor Unpause |
 
 ---
 

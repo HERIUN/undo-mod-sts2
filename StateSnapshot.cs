@@ -121,6 +121,7 @@ public class StateSnapshot
         public List<PowerSnapshot> Powers = new();
         public Creature? CreatureRef;
         public MoveState? NextMoveRef;  // Monster.NextMove 참조
+        public Godot.Vector2? OriginalPosition;  // NCreature 노드의 원래 위치
     }
 
     public class PowerSnapshot
@@ -284,6 +285,25 @@ public class StateSnapshot
                 {
                     if (enemy.Monster?.NextMove != null)
                         es.NextMoveRef = enemy.Monster.NextMove;
+                }
+                catch { }
+                // NCreature 노드 위치 저장 (부활 시 원래 위치 복원용)
+                try
+                {
+                    var tree2 = Godot.Engine.GetMainLoop() as Godot.SceneTree;
+                    if (tree2?.Root != null)
+                    {
+                        var combatRoom = FindNodeByType(tree2.Root, "NCombatRoom");
+                        if (combatRoom != null)
+                        {
+                            var getCreatureNode = combatRoom.GetType().GetMethod("GetCreatureNode", AllInstance);
+                            var creatureNode = getCreatureNode?.Invoke(combatRoom, new object[] { enemy }) as Godot.Node;
+                            if (creatureNode is Godot.Control ctrl)
+                                es.OriginalPosition = ctrl.Position;
+                            else if (creatureNode is Godot.Node2D n2d)
+                                es.OriginalPosition = n2d.Position;
+                        }
+                    }
                 }
                 catch { }
                 snap.Enemies.Add(es);
@@ -702,11 +722,33 @@ public class StateSnapshot
                                 // 현재 CombatState 확인
                                 var csProperty = aqsInstance.GetType().GetProperty("CombatState", AllInstance);
                                 var currentCS = csProperty?.GetValue(aqsInstance);
-                                var acsType = typeof(CombatManager).Assembly
-                                    .GetType("MegaCrit.Sts2.Core.GameActions.Multiplayer.ActionSynchronizerCombatState");
-                                var playPhaseVal = acsType != null ? Enum.Parse(acsType, "PlayPhase") : null;
 
-                                ModEntry.Log($"  ActionQueueSynchronizer.CombatState = {currentCS}");
+                                // enum 타입을 프로퍼티에서 동적으로 가져오기
+                                var csEnumType = csProperty?.PropertyType;
+                                object? playPhaseVal = null;
+                                if (csEnumType != null && csEnumType.IsEnum)
+                                {
+                                    try { playPhaseVal = Enum.Parse(csEnumType, "PlayPhase"); }
+                                    catch { }
+                                }
+                                // 폴백: 하드코딩 타입명 시도
+                                if (playPhaseVal == null)
+                                {
+                                    foreach (var typeName in new[] {
+                                        "MegaCrit.Sts2.Core.GameActions.Multiplayer.ActionSynchronizerCombatState",
+                                        "MegaCrit.Sts2.Core.Combat.ActionSynchronizerCombatState",
+                                        "MegaCrit.Sts2.Core.GameActions.ActionSynchronizerCombatState" })
+                                    {
+                                        var acsType = typeof(CombatManager).Assembly.GetType(typeName);
+                                        if (acsType != null)
+                                        {
+                                            try { playPhaseVal = Enum.Parse(acsType, "PlayPhase"); break; }
+                                            catch { }
+                                        }
+                                    }
+                                }
+
+                                ModEntry.Log($"  ActionQueueSynchronizer.CombatState = {currentCS} (enumType={csEnumType?.Name}, playPhaseVal={playPhaseVal})");
 
                                 // PlayPhase가 아닌 경우에만 SetCombatState 호출
                                 if (currentCS != null && playPhaseVal != null && !currentCS.Equals(playPhaseVal))
@@ -1231,7 +1273,7 @@ public class StateSnapshot
                     {
                         try
                         {
-                            ReviveEnemy(es.CreatureRef);
+                            ReviveEnemy(es.CreatureRef, es.Index, es.OriginalPosition);
                         }
                         catch (Exception ex)
                         {
@@ -2494,7 +2536,7 @@ public class StateSnapshot
     }
 
     /// <summary>죽은 적을 부활시킴: NCreature 노드 재생성 + NCombatRoom에 추가</summary>
-    private static void ReviveEnemy(Creature enemy)
+    private static void ReviveEnemy(Creature enemy, int originalIndex = -1, Godot.Vector2? originalPosition = null)
     {
         // NCombatRoom.Instance에 접근
         var tree = Godot.Engine.GetMainLoop() as Godot.SceneTree;
@@ -2620,19 +2662,59 @@ public class StateSnapshot
             addCreature.Invoke(combatRoomNode, new object[] { enemy });
             ModEntry.Log($"  적 부활 (새 노드 생성): {enemy.Name}");
 
-            // 4) 인텐트 UI 갱신
+            // 4) 새 NCreature 노드 찾아서 위치 + 인텐트 복원
             try
             {
                 var getCreatureNode = combatRoomNode.GetType().GetMethod("GetCreatureNode", AllInstance);
                 var newNode = getCreatureNode?.Invoke(combatRoomNode, new object[] { enemy }) as Godot.Node;
                 if (newNode != null)
                 {
+                    // 원래 위치 복원
+                    if (originalPosition.HasValue)
+                    {
+                        if (newNode is Godot.Control ctrl)
+                        {
+                            ctrl.Position = originalPosition.Value;
+                            ModEntry.Log($"  적 위치 복원 (Control): {enemy.Name} → {originalPosition.Value}");
+                        }
+                        else if (newNode is Godot.Node2D n2d)
+                        {
+                            n2d.Position = originalPosition.Value;
+                            ModEntry.Log($"  적 위치 복원 (Node2D): {enemy.Name} → {originalPosition.Value}");
+                        }
+                    }
+
+                    // _creatureNodes 리스트에서 올바른 인덱스에 배치
+                    if (originalIndex >= 0 && creatureNodesField?.GetValue(combatRoomNode) is System.Collections.IList nodesList)
+                    {
+                        int currentIdx = -1;
+                        for (int i = 0; i < nodesList.Count; i++)
+                        {
+                            var n = nodesList[i] as Godot.Node;
+                            var eProp = n?.GetType().GetProperty("Entity", AllInstance);
+                            if (eProp?.GetValue(n) as Creature == enemy)
+                            {
+                                currentIdx = i;
+                                break;
+                            }
+                        }
+                        if (currentIdx >= 0 && currentIdx != originalIndex)
+                        {
+                            var nodeToMove = nodesList[currentIdx];
+                            nodesList.RemoveAt(currentIdx);
+                            int insertAt = Math.Min(originalIndex, nodesList.Count);
+                            nodesList.Insert(insertAt, nodeToMove);
+                            ModEntry.Log($"  _creatureNodes 인덱스 재배치: {currentIdx} → {insertAt}");
+                        }
+                    }
+
+                    // 인텐트 UI 갱신
                     var refreshIntents = newNode.GetType().GetMethod("RefreshIntents", AllInstance);
                     refreshIntents?.Invoke(newNode, null);
                     ModEntry.Log($"  인텐트 UI 갱신 완료");
                 }
             }
-            catch (Exception ex) { ModEntry.Log($"  인텐트 UI 갱신 실패: {ex.Message}"); }
+            catch (Exception ex) { ModEntry.Log($"  적 부활 후 복원 실패: {ex.Message}"); }
         }
         else
         {
