@@ -23,10 +23,7 @@ public static class UndoManager
 
         try
         {
-            var state = CombatManager.Instance?.DebugOnlyGetState();
-            if (state == null) return;
-
-            var snap = StateSnapshot.Capture(state);
+            var snap = StateSnapshot.Capture();
             if (snap == null || snap.IsFailed) return;
 
         _snapshots.Push(snap);
@@ -67,8 +64,7 @@ public static class UndoManager
             return false;
         }
 
-        var state = CombatManager.Instance?.DebugOnlyGetState();
-        if (state == null)
+        if (CombatManager.Instance == null)
         {
             ModEntry.Log("전투 상태를 가져올 수 없습니다.");
             return false;
@@ -82,9 +78,7 @@ public static class UndoManager
         // 1) ActionQueueSet.IsEmpty — 진행 중인 액션이 있으면 차단
         try
         {
-            var runMgrType = typeof(CombatManager).Assembly.GetType("MegaCrit.Sts2.Core.Runs.RunManager");
-            var runInstance = runMgrType?.GetProperty("Instance",
-                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)?.GetValue(null);
+            var runInstance = MegaCrit.Sts2.Core.Runs.RunManager.Instance;
             if (runInstance != null)
             {
                 var aqSetProp = runInstance.GetType().GetProperty("ActionQueueSet", flags);
@@ -103,92 +97,30 @@ public static class UndoManager
         }
         catch { }
 
-        // 2) 화면 전환(Transition) 중 차단
+        // 2) 카드 선택 UI가 열려있으면 undo 차단
         try
         {
-            var nGame = typeof(CombatManager).Assembly.GetType("MegaCrit.Sts2.Core.Nodes.NGame");
-            var nGameInstance = nGame?.GetProperty("Instance",
-                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)?.GetValue(null);
-            if (nGameInstance != null)
+            var hand = MegaCrit.Sts2.Core.Nodes.Combat.NPlayerHand.Instance;
+            if (hand != null)
             {
-                var transitionProp = nGameInstance.GetType().GetProperty("Transition", flags);
-                var transition = transitionProp?.GetValue(nGameInstance);
-                if (transition != null)
+                var isInSelectionProp = hand.GetType().GetProperty("IsInCardSelection", flags);
+                var isInSelection = isInSelectionProp?.GetValue(hand) as bool? ?? false;
+                if (isInSelection)
                 {
-                    var inTransitionProp = transition.GetType().GetProperty("InTransition", flags);
-                    var inTransition = inTransitionProp?.GetValue(transition) as bool? ?? false;
-                    if (inTransition)
-                    {
-                        ModEntry.Log("화면 전환 중에는 Undo 불가합니다.");
-                        return false;
-                    }
-                }
-            }
-        }
-        catch { }
-
-        // 3) 카드 플레이 애니메이션 중 차단 (NCardPlayQueue)
-        try
-        {
-            var tree = Godot.Engine.GetMainLoop() as Godot.SceneTree;
-            if (tree?.Root != null)
-            {
-                var playQueue = FindNodeByType(tree.Root, "NCardPlayQueue");
-                if (playQueue != null)
-                {
-                    var countProp = playQueue.GetType().GetProperty("Count", flags)
-                        ?? playQueue.GetType().GetProperty("QueueCount", flags);
-                    if (countProp != null)
-                    {
-                        var count = countProp.GetValue(playQueue);
-                        if (count is int c && c > 0)
-                        {
-                            ModEntry.Log("카드 플레이 애니메이션 중에는 Undo 불가합니다.");
-                            return false;
-                        }
-                    }
-                    // 자식 노드 수로도 체크
-                    if (playQueue is Godot.Node pqNode && pqNode.GetChildCount() > 0)
-                    {
-                        ModEntry.Log("카드 플레이 큐에 항목이 있어 Undo 불가합니다.");
-                        return false;
-                    }
-                }
-            }
-        }
-        catch { }
-
-        // 4) 카드 선택 UI가 열려있으면 undo 차단
-        try
-        {
-            var tree = Godot.Engine.GetMainLoop() as Godot.SceneTree;
-            if (tree?.Root != null)
-            {
-                var handNode = FindNodeByType(tree.Root, "NPlayerHand");
-                if (handNode != null)
-                {
-                    var isInSelectionProp = handNode.GetType().GetProperty("IsInCardSelection", flags);
-                    var isInSelection = isInSelectionProp?.GetValue(handNode) as bool? ?? false;
-                    if (isInSelection)
-                    {
-                        ModEntry.Log("카드 선택 중에는 Undo 불가 — 선택을 완료하거나 취소하세요.");
-                        return false;
-                    }
+                    ModEntry.Log("카드 선택 중에는 Undo 불가 — 선택을 완료하거나 취소하세요.");
+                    return false;
                 }
             }
         }
         catch { }
 
         var snap = _snapshots.Pop();
-        bool crossTurn = snap.RoundNumber != state.RoundNumber;
-        if (crossTurn)
-            ModEntry.Log($"크로스턴 Undo: 턴 {state.RoundNumber} → {snap.RoundNumber}");
 
         IsRestoring = true;
         bool ok;
         try
         {
-            ok = snap.Restore(state);
+            ok = snap.Restore();
         }
         finally
         {
@@ -196,19 +128,14 @@ public static class UndoManager
         }
 
         if (ok)
-            ModEntry.Log($"Undo 완료! (남은 스냅샷: {_snapshots.Count})");
-        return ok;
-    }
-
-    private static Godot.Node? FindNodeByType(Godot.Node root, string typeName)
-    {
-        if (root.GetType().Name == typeName) return root;
-        for (int i = 0; i < root.GetChildCount(); i++)
         {
-            var found = FindNodeByType(root.GetChild(i), typeName);
-            if (found != null) return found;
+            // 데이터 복원 후 비주얼 갱신 (참조 레포 패턴)
+            try { VisualRefresh.RefreshAllVisuals(); }
+            catch (System.Exception ex) { ModEntry.Log($"RefreshAllVisuals 실패: {ex.Message}"); }
+
+            ModEntry.Log($"Undo 완료! (남은 스냅샷: {_snapshots.Count})");
         }
-        return null;
+        return ok;
     }
 
     /// <summary>전투 시작/종료 시 스냅샷 초기화</summary>

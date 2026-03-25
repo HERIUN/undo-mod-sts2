@@ -1,8 +1,12 @@
 using System;
 using System.Linq;
 using System.Reflection;
+using System.Threading.Tasks;
 using HarmonyLib;
 using MegaCrit.Sts2.Core.Combat;
+using MegaCrit.Sts2.Core.Entities.Creatures;
+using MegaCrit.Sts2.Core.Entities.Players;
+using MegaCrit.Sts2.Core.Models;
 
 namespace UndoMod;
 
@@ -478,8 +482,9 @@ public static class EndTurnPatcher
 }
 
 /// <summary>
-/// NetUsePotionAction.ExecuteAction()에 prefix를 패치하여
-/// 포션 사용 직전에 스냅샷을 저장한다.
+/// UsePotionAction / DiscardPotionGameAction 생성자에 prefix를 패치하여
+/// 포션 사용/버리기 직전에 스냅샷을 저장한다.
+/// (참고 레포와 동일: 생성자 패치 → ExecuteAction이 async여도 안전)
 /// </summary>
 public static class UsePotionPatcher
 {
@@ -492,35 +497,30 @@ public static class UsePotionPatcher
 
         try
         {
-            var asm = typeof(CombatManager).Assembly;
-            var flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+            var prefix = new HarmonyMethod(typeof(UsePotionPatcher).GetMethod(nameof(BeforeUsePotion),
+                BindingFlags.Static | BindingFlags.Public));
 
-            // UsePotion 관련 GameAction 타입 검색
-            Type[]? allTypes = null;
-            try { allTypes = asm.GetTypes(); }
-            catch (ReflectionTypeLoadException ex) { allTypes = ex.Types.Where(t => t != null).ToArray()!; }
-
-            // UsePotionAction, UsePotionGameAction 등 ExecuteAction을 가진 타입 찾기
-            foreach (var t in allTypes)
+            // UsePotionAction constructor
+            var usePotionType = typeof(MegaCrit.Sts2.Core.GameActions.UsePotionAction);
+            var useCtor = AccessTools.Constructor(usePotionType,
+                new[] { typeof(PotionModel), typeof(Creature), typeof(bool) });
+            if (useCtor != null)
             {
-                var tn = t.Name.ToLower();
-                if (tn.Contains("potion") && (tn.Contains("use") || tn.Contains("discard")))
-                {
-                    var executeAction = t.GetMethod("ExecuteAction", flags);
-                    if (executeAction != null)
-                    {
-                        var prefix = typeof(UsePotionPatcher).GetMethod(nameof(BeforeUsePotion),
-                            BindingFlags.Static | BindingFlags.Public);
-                        _harmony.Patch(executeAction, prefix: new HarmonyMethod(prefix));
-                        ModEntry.Log($"포션 액션 패치 완료: {t.FullName}");
-                    }
-                    else
-                    {
-                        ModEntry.Log($"포션 관련 타입 (ExecuteAction 없음): {t.FullName}");
-                        foreach (var m in t.GetMethods(flags).Where(m => !m.IsSpecialName && m.DeclaringType == t))
-                            ModEntry.Log($"  M: {m.Name}");
-                    }
-                }
+                _harmony.Patch(useCtor, prefix: prefix);
+                ModEntry.Log("포션 사용 생성자 패치 완료: UsePotionAction");
+            }
+
+            // DiscardPotionGameAction constructor
+            var discardType = typeof(MegaCrit.Sts2.Core.GameActions.DiscardPotionGameAction);
+            var discardCtor = AccessTools.Constructor(discardType,
+                new[] { typeof(Player), typeof(uint), typeof(bool) });
+            if (discardCtor == null)
+                discardCtor = AccessTools.Constructor(discardType,
+                    new[] { typeof(Player), typeof(uint) });
+            if (discardCtor != null)
+            {
+                _harmony.Patch(discardCtor, prefix: prefix);
+                ModEntry.Log("포션 버리기 생성자 패치 완료: DiscardPotionGameAction");
             }
 
             _patched = true;
@@ -769,6 +769,17 @@ public static class NCardSafetyPatcher
         }
         catch (Exception ex) { ModEntry.Log($"[NCardSafety] Layer5 오류: {ex.Message}"); }
 
+        // === Layer 6: TaskHelper.RunSafely — 글로벌 async GameAction 예외 억제 ===
+        // TaskHelper.RunSafely(Task)는 동기 메서드이므로 Postfix로 반환된 Task를
+        // NullRef/ObjectDisposed 억제 wrapper로 감싼다.
+        // 이렇게 하면 SwipePower.Steal 등 async 체인에서 발생하는 예외가
+        // ActionExecutor까지 전파되지 않아 턴 체인이 끊기지 않는다.
+        try
+        {
+            TaskSafetyPatcher.Patch();
+        }
+        catch (Exception ex) { ModEntry.Log($"[NCardSafety] Layer6 (TaskSafety) 오류: {ex.Message}"); }
+
         ModEntry.Log($"[NCardSafety] 패치 완료: {total}개");
     }
 
@@ -797,5 +808,103 @@ public static class NCardSafetyPatcher
             return null;
         }
         return __exception;
+    }
+
+    /// <summary>
+    /// Harmony Finalizer: NullReferenceException도 삼킨다 (undo 후 적턴 크래시 방지).
+    /// </summary>
+    public static Exception? SuppressNullRef(Exception? __exception)
+    {
+        if (__exception is NullReferenceException nre)
+        {
+            ModEntry.Log($"[NCardSafety] NullReferenceException 억제: {nre.Message}");
+            return null;
+        }
+        if (__exception is ObjectDisposedException ode)
+        {
+            ModEntry.Log($"[NCardSafety] ObjectDisposedException 억제: {ode.Message}");
+            return null;
+        }
+        return __exception;
+    }
+}
+
+/// <summary>
+/// TaskHelper.RunSafely(Task) Postfix 패치.
+/// 반환된 Task를 NullRef/ObjectDisposed 억제 wrapper로 감싸서
+/// async GameAction 체인에서 발생하는 예외가 전파되지 않도록 한다.
+/// 이렇게 하면 크로스턴 undo 후 적턴(SwipePower.Steal 등)에서
+/// NullRef가 발생해도 턴 체인이 끊기지 않고 정상 진행된다.
+/// </summary>
+public static class TaskSafetyPatcher
+{
+    private static bool _patched;
+    private static readonly Harmony _harmony = new("undo_mod.tasksafety");
+
+    public static void Patch()
+    {
+        if (_patched) return;
+        _patched = true;
+
+        try
+        {
+            var taskHelperType = typeof(CombatManager).Assembly.GetType(
+                "MegaCrit.Sts2.Core.Helpers.TaskHelper");
+            if (taskHelperType == null)
+            {
+                ModEntry.Log("[TaskSafety] TaskHelper 타입을 찾을 수 없습니다.");
+                return;
+            }
+
+            var runSafely = taskHelperType.GetMethod("RunSafely",
+                BindingFlags.Static | BindingFlags.Public,
+                null,
+                new[] { typeof(System.Threading.Tasks.Task) },
+                null);
+            if (runSafely == null)
+            {
+                ModEntry.Log("[TaskSafety] RunSafely 메서드를 찾을 수 없습니다.");
+                return;
+            }
+
+            var postfix = typeof(TaskSafetyPatcher).GetMethod(nameof(RunSafelyPostfix),
+                BindingFlags.Static | BindingFlags.Public);
+            _harmony.Patch(runSafely, postfix: new HarmonyMethod(postfix));
+            ModEntry.Log("[TaskSafety] TaskHelper.RunSafely Postfix 패치 완료!");
+        }
+        catch (Exception ex)
+        {
+            ModEntry.Log($"[TaskSafety] 패치 오류: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// RunSafely가 반환한 Task를 예외 억제 wrapper로 교체한다.
+    /// NullReferenceException, ObjectDisposedException만 억제하고
+    /// 나머지 예외는 그대로 전파한다.
+    /// </summary>
+    public static void RunSafelyPostfix(ref System.Threading.Tasks.Task __result)
+    {
+        if (__result != null)
+        {
+            __result = WrapWithSafety(__result);
+        }
+    }
+
+    private static async System.Threading.Tasks.Task WrapWithSafety(System.Threading.Tasks.Task original)
+    {
+        try
+        {
+            await original;
+        }
+        catch (NullReferenceException ex)
+        {
+            ModEntry.Log($"[TaskSafety] GameAction NullRef 억제: {ex.Message}\n{ex.StackTrace}");
+            // 예외를 삼켜서 Task가 정상 완료로 처리되도록 함
+        }
+        catch (ObjectDisposedException ex)
+        {
+            ModEntry.Log($"[TaskSafety] GameAction ObjectDisposed 억제: {ex.Message}");
+        }
     }
 }
