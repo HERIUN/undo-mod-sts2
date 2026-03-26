@@ -1,5 +1,6 @@
 {
-  "pckName": "UndoMod",
+  "id": "UndoMod",
+  "pck_name": "UndoMod",
   "name": "Undo",
   "author": "sts-agent",
   "version": "1.0.0",
