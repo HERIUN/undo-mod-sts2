@@ -8,21 +8,22 @@
 
 ### 일반 사용자 (빌드 없이 설치)
 
-1. 릴리즈에서 `UndoMod.dll`과 `mod_manifest.json` 두 파일을 다운로드합니다.
+1. [릴리즈 페이지](https://github.com/HERIUN/undo-mod-sts2/releases)에서 `UndoMod.dll`, `UndoMod.pck`, `mod_manifest.json` 세 파일을 다운로드합니다.
 
-2. 게임 폴더 안에 `mods\UndoMod\` 디렉토리를 만들고 두 파일을 넣습니다:
+2. 게임 폴더 안에 `mods\UndoMod\` 디렉토리를 만들고 세 파일을 넣습니다:
 
    ```
    C:\Program Files (x86)\Steam\steamapps\common\Slay the Spire 2\
    └── mods\
        └── UndoMod\
            ├── UndoMod.dll
+           ├── UndoMod.pck
            └── mod_manifest.json
    ```
 
 3. 게임을 시작하면 모드가 자동으로 로드됩니다.
 
-별도 프로그램 설치는 필요 없습니다. 위 두 파일만 올바른 경로에 넣으면 됩니다.
+별도 프로그램 설치는 필요 없습니다. 위 세 파일만 올바른 경로에 넣으면 됩니다.
 
 ### 개발자 (소스에서 빌드)
 
@@ -41,7 +42,7 @@ dotnet build -c Release
 ```
 
 빌드된 DLL은 `bin\Release\net9.0\UndoMod.dll`에 생성됩니다.
-이 파일과 `mod_manifest.json`을 게임의 `mods\UndoMod\` 폴더에 복사하면 됩니다.
+이 파일과 `UndoMod.pck`, `mod_manifest.json`을 게임의 `mods\UndoMod\` 폴더에 복사하면 됩니다.
 
 ---
 
@@ -234,9 +235,9 @@ undo_mod/
 ├── StateSnapshot.cs     # 상태 캡처/복원 핵심 로직
 ├── VisualRefresh.cs     # 비주얼 갱신 (핸드/파워/포션/구체/HP바 등)
 ├── UndoMod.csproj       # 프로젝트 설정 (.NET 9.0, x64)
+├── UndoMod.pck          # Godot PCK 파일 (mod_manifest.json 포함, 모드 로더 필수)
 ├── mod_manifest.json    # 모드 메타데이터
-├── deploy.py            # 빌드 + 배포 스크립트
-└── build_pck.py         # Godot 4 PCK 파일 생성
+└── deploy.py            # 빌드 + 배포 스크립트
 ```
 
 ---
