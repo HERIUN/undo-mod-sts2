@@ -11,6 +11,7 @@ GAME_PATH = r"C:\Program Files (x86)\Steam\steamapps\common\Slay the Spire 2"
 MOD_NAME = "UndoMod"
 MOD_DIR = os.path.dirname(__file__)
 DLL_PATH = os.path.join(MOD_DIR, "bin", "Release", "net9.0", f"{MOD_NAME}.dll")
+PCK_PATH = os.path.join(MOD_DIR, f"{MOD_NAME}.pck")
 MANIFEST_PATH = os.path.join(MOD_DIR, "mod_manifest.json")
 DEST_DIR = os.path.join(GAME_PATH, "mods", MOD_NAME)
 
@@ -24,10 +25,12 @@ if not os.path.exists(DLL_PATH):
 
 os.makedirs(DEST_DIR, exist_ok=True)
 shutil.copy2(DLL_PATH, DEST_DIR)
+shutil.copy2(PCK_PATH, DEST_DIR)
 shutil.copy2(MANIFEST_PATH, DEST_DIR)
 
 print(f"\n배포 완료:")
 print(f"  DLL: {DLL_PATH} -> {DEST_DIR}")
+print(f"  PCK: {PCK_PATH} -> {DEST_DIR}")
 print(f"  Manifest: {MANIFEST_PATH} -> {DEST_DIR}")
 print(f"\n게임 mods 폴더: {DEST_DIR}")
 print("게임을 재시작하면 모드가 로드됩니다.")
