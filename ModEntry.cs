@@ -1,3 +1,4 @@
+using System;
 using System.Reflection;
 using HarmonyLib;
 using MegaCrit.Sts2.Core.Modding;
@@ -11,8 +12,13 @@ public class ModEntry
     {
         var harmony = new Harmony("undo_mod.patch");
         harmony.PatchAll(Assembly.GetExecutingAssembly());
-        UndoInput.Start();
-        UndoTcpServer.Start();
+
+        try { UndoInput.Start(); }
+        catch (Exception ex) { Log($"UndoInput 시작 실패 (무시): {ex.Message}"); }
+
+        try { UndoTcpServer.Start(); }
+        catch (Exception ex) { Log($"TCP 서버 시작 실패 (무시): {ex.Message}"); }
+
         Log("UndoMod 로드됨 (Ctrl+Z = Undo, TCP 포트 " + UndoTcpServer.Port + ")");
     }
 
